@@ -1,0 +1,36 @@
+name: Duviri mood watcher
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: duviri
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Restore last known mood
+        uses: actions/cache/restore@v4
+        with:
+          key: duviri-state
+          path: duviri-state.json
+          restore-keys: duviri-state
+
+      - name: Check Duviri mood
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: node duviri.mjs
+
+      - name: Save last known mood
+        uses: actions/cache/save@v4
+        with:
+          key: duviri-state-${{ github.run_id }}
+          path: duviri-state.json
