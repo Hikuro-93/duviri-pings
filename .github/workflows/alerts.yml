@@ -1,0 +1,36 @@
+name: Alerts
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: alerts
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: .alerts-state
+          key: alerts-state-${{ github.run_id }}
+          restore-keys: alerts-state
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - env:
+          ALERTS_WEBHOOK_URL: ${{ secrets.ALERTS_WEBHOOK_URL }}
+        run: node alerts.mjs
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .alerts-state
+          key: alerts-state-${{ github.run_id }}
