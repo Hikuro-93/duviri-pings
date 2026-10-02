@@ -5,8 +5,8 @@
 //   FISSURE_MODE=storm -> Steel Path Void Storms (isHard && isStorm)
 // No dependencies. Node 20+ (global fetch).
 
-import fs from 'node:fs';
-import path from 'node:path';
+import fs from 'node\:fs';
+import path from 'node\:path';
 
 const MODE = process.env.FISSURE_MODE === 'storm' ? 'storm' : 'sp';
 const API = 'https://api.warframestat.us/pc/fissures';
@@ -88,7 +88,14 @@ function saveJson(file, data) {
 async function req(url, { method = 'GET', body, bot = false } = {}) {
   const headers = { 'Content-Type': 'application/json' };
   if (bot) headers.Authorization = `Bot ${BOT_TOKEN}`;
-  const res = await fetch(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  const payload = body === undefined ? undefined : JSON.stringify(body);
+  let res = await fetch(url, { method, headers, body: payload });
+  for (let attempt = 0; res.status === 429 && attempt < 5; attempt++) {
+    const data = await res.json().catch(() => ({}));
+    const wait = (data.retry_after ?? 0.5) * 1000 + 50;
+    await new Promise((r) => setTimeout(r, wait));
+    res = await fetch(url, { method, headers, body: payload });
+  }
   if (!res.ok) {
     const detail = (await res.text().catch(() => '')).slice(0, 300);
     throw new Error(`${method} ${url} -> ${res.status} ${detail}`);
@@ -132,8 +139,10 @@ async function ensureBoard() {
   }
 
   // Seed one reaction per category (idempotent), so users just click.
+  // Discord caps reaction adds at 1 per 0.25s per channel, so pace them.
   for (const [, , emoji] of CATEGORIES) {
     await req(`${DISCORD}/channels/${CHANNEL_ID}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}/@me`, { method: 'PUT', bot: true });
+    await new Promise((r) => setTimeout(r, 350));
   }
 
   // A category is enabled if any non-bot user reacted.
@@ -173,55 +182,4 @@ function toUnix(iso) {
 }
 
 function fissureEmbed(f) {
-  const era = eraOf(f);
-  const cat = categoryOf(f);
-  const emoji = CATEGORIES.find(([key]) => key === cat)?.[2] || '🪙';
-  const expiry = toUnix(f.expiry);
-  const logo = FACTION_LOGOS[f.enemy];
-  return {
-    title: `${emoji} ${f.missionType} — ${f.node}`,
-    color: era.color,
-    description: `${era.name} relic era`,
-    thumbnail: era.icon ? { url: era.icon } : undefined,
-    author: logo ? { name: f.enemy, icon_url: logo } : undefined,
-    fields: [
-      { name: 'Expires', value: expiry ? `<t:${expiry}:R> (<t:${expiry}:t>)` : 'unknown', inline: true },
-      ...(f.enemy ? [{ name: 'Faction', value: f.enemy, inline: true }] : []),
-    ],
-    footer: { text: MODE === 'storm' ? 'Steel Path Void Storm' : 'Steel Path Fissure' },
-    timestamp: f.activation || new Date().toISOString(),
-  };
-}
-
-// ---------- main ----------
-
-async function main() {
-  const enabled = await ensureBoard();
-  const fissures = await req(API);
-  if (!Array.isArray(fissures)) throw new Error('Unexpected API response');
-
-  const relevant = fissures.filter((f) =>
-    MODE === 'storm' ? (f.isStorm && f.isHard) : (f.isHard && !f.isStorm),
-  );
-
-  const activeIds = new Set(relevant.map((f) => f.id));
-  const seenSet = new Set(loadJson(seenFile, []).filter((id) => activeIds.has(id)));
-
-  // Ping only fissures that are new since last run AND whose category is enabled.
-  const fresh = relevant.filter((f) => !seenSet.has(f.id) && enabled.has(categoryOf(f)));
-
-  for (const f of fresh) {
-    await req(WEBHOOK_URL, { method: 'POST', body: { embeds: [fissureEmbed(f)] } });
-    console.log(`Posted: ${f.missionType} — ${f.node} (${eraOf(f).name})`);
-  }
-
-  // Snapshot every currently active fissure as known, so toggling a category
-  // never retroactively pings fissures that were already up when you clicked.
-  saveJson(seenFile, relevant.map((f) => f.id));
-  console.log(`Mode ${MODE}: ${relevant.length} active SP ${MODE === 'storm' ? 'storms' : 'fissures'}, ${enabled.size}/${CATEGORIES.length} categories enabled, ${fresh.length} posted this run.`);
-}
-
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+  const
