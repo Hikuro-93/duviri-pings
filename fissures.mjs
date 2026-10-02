@@ -2,7 +2,9 @@
 // Steel Path fissure poller with reaction-menu boards.
 // Modes:
 //   FISSURE_MODE=sp    -> Steel Path starchart fissures (isHard && !isStorm)
-//   FISSURE_MODE=storm -> Steel Path Void Storms (isHard && isStorm)
+//   FISSURE_MODE=storm -> Void Storms (isStorm; the API never marks storms as
+//                        hard because the same storm entry serves normal and
+//                        Steel Path, SP is selected when launching it)
 // No dependencies. Node 20+ (global fetch).
 
 import fs from 'node:fs';
@@ -23,7 +25,10 @@ if (!BOT_TOKEN || !CHANNEL_ID || !WEBHOOK_URL) {
 
 // ---------- categories (reaction board) ----------
 
-const BASE_CATEGORIES = [
+// Starchart SP fissures. Void Armageddon is excluded: fissures on Zariman only
+// ever roll Void Flood (Everview Arc) and Void Cascade (Tuvul Commons), both
+// Omnia. Alchemy and the Lua/Deimos Omnia survivals roll under existing types.
+const SP_CATEGORIES = [
   ['capture', 'Capture', '🎯'],
   ['extermination', 'Extermination', '💀'],
   ['rescue', 'Rescue', '🛟'],
@@ -37,15 +42,23 @@ const BASE_CATEGORIES = [
   ['disruption', 'Disruption', '⚡'],
   ['void-cascade', 'Void Cascade', '🌪️'],
   ['void-flood', 'Void Flood', '🌊'],
-  ['void-armageddon', 'Void Armageddon', '☄️'],
   ['alchemy', 'Alchemy', '⚗️'],
   ['kuva-survival', 'Kuva Survival', '🩸'],
 ];
+
+// Void Storms only ever roll these mission types (confirmed from live data).
 const STORM_CATEGORIES = [
   ['skirmish', 'Skirmish', '🚀'],
   ['volatile', 'Volatile', '☢️'],
+  ['extermination', 'Extermination', '💀'],
+  ['survival', 'Survival', '⏳'],
 ];
-const CATEGORIES = MODE === 'storm' ? [...BASE_CATEGORIES, ...STORM_CATEGORIES] : BASE_CATEGORIES;
+
+const CATEGORIES = MODE === 'storm' ? STORM_CATEGORIES : SP_CATEGORIES;
+
+// Bump when category lists change: the old board gets deleted and re-created
+// so stale reactions disappear. Users must re-click their toggles.
+const BOARD_VERSION = 2;
 
 // ---------- eras (color bar + relic icon thumbnail) ----------
 
@@ -58,16 +71,30 @@ const ERAS = {
   omnia: { name: 'Omnia', color: 0x2FA8C5, icon: null }, // no standalone Omnia relic icon exists
 };
 
-const FACTION_LOGOS = {
-  Grineer: 'https://wiki.warframe.com/images/Grineer.png',
-  Corpus: 'https://wiki.warframe.com/images/Corpus.png',
-  Infestation: 'https://wiki.warframe.com/images/Infestation.png',
-  Infested: 'https://wiki.warframe.com/images/Infestation.png',
-  Orokin: 'https://wiki.warframe.com/images/OrokinEmblem.png',
-  Corrupted: 'https://wiki.warframe.com/images/OrokinEmblem.png',
-  Murmur: 'https://wiki.warframe.com/images/Murmur.png',
-  'The Murmur': 'https://wiki.warframe.com/images/Murmur.png',
+// ---------- factions (author glyph per ping) ----------
+
+// Green recreation of the in-game emblem, self-hosted in this repo's assets.
+// Official white alternative: 'https://wiki.warframe.com/images/IconInfested%28xWhite%29.png'
+const INFESTED_GLYPH = 'https://raw.githubusercontent.com/Hikuro-93/duviri-pings/main/assets/infested-emblem.png';
+
+const FACTION_GLYPHS = {
+  Grineer: { name: 'Grineer', icon: 'https://wiki.warframe.com/images/GrineerGlyph.png' },
+  Corpus: { name: 'Corpus', icon: 'https://wiki.warframe.com/images/CorpusGlyph.png' },
+  Infestation: { name: 'Infestation', icon: INFESTED_GLYPH },
+  Infested: { name: 'Infested', icon: INFESTED_GLYPH },
+  Orokin: { name: 'Orokin', icon: 'https://wiki.warframe.com/images/IconOrokinOn%28xWhite%29.png' },
+  Corrupted: { name: 'Corrupted', icon: 'https://wiki.warframe.com/images/IconOrokinOn%28xWhite%29.png' },
+  Murmur: { name: 'The Murmur', icon: 'https://wiki.warframe.com/images/TheMurmurIconColor.png' },
+  'The Murmur': { name: 'The Murmur', icon: 'https://wiki.warframe.com/images/TheMurmurIconColor.png' },
 };
+
+function factionOf(f) {
+  // Kuva Fortress and Zariman report plain "Grineer" in the data; show the Kuva glyph there.
+  if (/Kuva Fortress|Zariman/.test(f.node || '')) {
+    return { name: 'Kuva Grineer', icon: 'https://wiki.warframe.com/images/KuvaGlyph.png' };
+  }
+  return FACTION_GLYPHS[f.enemy] || { name: f.enemy, icon: null };
+}
 
 // ---------- state ----------
 
@@ -129,13 +156,19 @@ function boardContent(enabled) {
 async function ensureBoard() {
   const boardState = loadJson(boardFile, {});
   let messageId = boardState.messageId;
+
+  // Category lists changed since this board was built: delete it and start fresh.
+  if (messageId && boardState.version !== BOARD_VERSION) {
+    await req(`${WEBHOOK_URL}/messages/${messageId}`, { method: 'DELETE' }).catch(() => {});
+    messageId = null;
+  }
   if (messageId && !(await messageExists(messageId))) messageId = null;
 
   if (!messageId) {
     const msg = await req(`${WEBHOOK_URL}?wait=true`, { method: 'POST', body: { content: boardContent(new Set()) } });
     messageId = msg.id;
-    saveJson(boardFile, { messageId });
-    console.log(`Created board message ${messageId}`);
+    saveJson(boardFile, { messageId, version: BOARD_VERSION });
+    console.log(`Created board message ${messageId} (version ${BOARD_VERSION})`);
   }
 
   // Seed one reaction per category (idempotent), so users just click.
@@ -186,16 +219,16 @@ function fissureEmbed(f) {
   const cat = categoryOf(f);
   const emoji = CATEGORIES.find(([key]) => key === cat)?.[2] || '🪙';
   const expiry = toUnix(f.expiry);
-  const logo = FACTION_LOGOS[f.enemy];
+  const faction = factionOf(f);
   return {
     title: `${emoji} ${f.missionType} — ${f.node}`,
     color: era.color,
     description: `${era.name} relic era`,
     thumbnail: era.icon ? { url: era.icon } : undefined,
-    author: logo ? { name: f.enemy, icon_url: logo } : undefined,
+    author: faction.icon ? { name: faction.name, icon_url: faction.icon } : undefined,
     fields: [
       { name: 'Expires', value: expiry ? `<t:${expiry}:R> (<t:${expiry}:t>)` : 'unknown', inline: true },
-      ...(f.enemy ? [{ name: 'Faction', value: f.enemy, inline: true }] : []),
+      { name: 'Faction', value: faction.name || 'Unknown', inline: true },
     ],
     footer: { text: MODE === 'storm' ? 'Steel Path Void Storm' : 'Steel Path Fissure' },
     timestamp: f.activation || new Date().toISOString(),
@@ -209,8 +242,10 @@ async function main() {
   const fissures = await req(API);
   if (!Array.isArray(fissures)) throw new Error('Unexpected API response');
 
+  // Starchart: SP fissures only. Storms: the API never flags storms as hard
+  // (SP is chosen when launching), so all storm entries are relevant.
   const relevant = fissures.filter((f) =>
-    MODE === 'storm' ? (f.isStorm && f.isHard) : (f.isHard && !f.isStorm),
+    MODE === 'storm' ? f.isStorm : (f.isHard && !f.isStorm),
   );
 
   const activeIds = new Set(relevant.map((f) => f.id));
@@ -227,7 +262,7 @@ async function main() {
   // Snapshot every currently active fissure as known, so toggling a category
   // never retroactively pings fissures that were already up when you clicked.
   saveJson(seenFile, relevant.map((f) => f.id));
-  console.log(`Mode ${MODE}: ${relevant.length} active SP ${MODE === 'storm' ? 'storms' : 'fissures'}, ${enabled.size}/${CATEGORIES.length} categories enabled, ${fresh.length} posted this run.`);
+  console.log(`Mode ${MODE}: ${relevant.length} active ${MODE === 'storm' ? 'void storms' : 'SP fissures'}, ${enabled.size}/${CATEGORIES.length} categories enabled, ${fresh.length} posted this run.`);
 }
 
 main().catch((err) => {
