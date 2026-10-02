@@ -1,4 +1,4 @@
-name: Duviri mood watcher
+name: Duviri
 
 on:
   schedule:
@@ -7,30 +7,30 @@ on:
 
 concurrency:
   group: duviri
+  cancel-in-progress: false
 
 jobs:
-  check:
+  poll:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: .duviri-state
+          key: duviri-state-${{ github.run_id }}
+          restore-keys: duviri-state
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Restore last known mood
-        uses: actions/cache/restore@v4
-        with:
-          key: duviri-state
-          path: duviri-state.json
-          restore-keys: duviri-state
-
-      - name: Check Duviri mood
-        env:
+      - env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: node duviri.mjs
 
-      - name: Save last known mood
-        uses: actions/cache/save@v4
+      - uses: actions/cache/save@v4
+        if: always()
         with:
+          path: .duviri-state
           key: duviri-state-${{ github.run_id }}
-          path: duviri-state.json
