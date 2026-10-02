@@ -5,8 +5,8 @@
 //   FISSURE_MODE=storm -> Steel Path Void Storms (isHard && isStorm)
 // No dependencies. Node 20+ (global fetch).
 
-import fs from 'node\:fs';
-import path from 'node\:path';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const MODE = process.env.FISSURE_MODE === 'storm' ? 'storm' : 'sp';
 const API = 'https://api.warframestat.us/pc/fissures';
@@ -182,4 +182,55 @@ function toUnix(iso) {
 }
 
 function fissureEmbed(f) {
-  const
+  const era = eraOf(f);
+  const cat = categoryOf(f);
+  const emoji = CATEGORIES.find(([key]) => key === cat)?.[2] || '🪙';
+  const expiry = toUnix(f.expiry);
+  const logo = FACTION_LOGOS[f.enemy];
+  return {
+    title: `${emoji} ${f.missionType} — ${f.node}`,
+    color: era.color,
+    description: `${era.name} relic era`,
+    thumbnail: era.icon ? { url: era.icon } : undefined,
+    author: logo ? { name: f.enemy, icon_url: logo } : undefined,
+    fields: [
+      { name: 'Expires', value: expiry ? `<t:${expiry}:R> (<t:${expiry}:t>)` : 'unknown', inline: true },
+      ...(f.enemy ? [{ name: 'Faction', value: f.enemy, inline: true }] : []),
+    ],
+    footer: { text: MODE === 'storm' ? 'Steel Path Void Storm' : 'Steel Path Fissure' },
+    timestamp: f.activation || new Date().toISOString(),
+  };
+}
+
+// ---------- main ----------
+
+async function main() {
+  const enabled = await ensureBoard();
+  const fissures = await req(API);
+  if (!Array.isArray(fissures)) throw new Error('Unexpected API response');
+
+  const relevant = fissures.filter((f) =>
+    MODE === 'storm' ? (f.isStorm && f.isHard) : (f.isHard && !f.isStorm),
+  );
+
+  const activeIds = new Set(relevant.map((f) => f.id));
+  const seenSet = new Set(loadJson(seenFile, []).filter((id) => activeIds.has(id)));
+
+  // Ping only fissures that are new since last run AND whose category is enabled.
+  const fresh = relevant.filter((f) => !seenSet.has(f.id) && enabled.has(categoryOf(f)));
+
+  for (const f of fresh) {
+    await req(WEBHOOK_URL, { method: 'POST', body: { embeds: [fissureEmbed(f)] } });
+    console.log(`Posted: ${f.missionType} — ${f.node} (${eraOf(f).name})`);
+  }
+
+  // Snapshot every currently active fissure as known, so toggling a category
+  // never retroactively pings fissures that were already up when you clicked.
+  saveJson(seenFile, relevant.map((f) => f.id));
+  console.log(`Mode ${MODE}: ${relevant.length} active SP ${MODE === 'storm' ? 'storms' : 'fissures'}, ${enabled.size}/${CATEGORIES.length} categories enabled, ${fresh.length} posted this run.`);
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
