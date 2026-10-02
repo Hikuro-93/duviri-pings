@@ -12,6 +12,8 @@ const SOLNODES_URL =
   'https://raw.githubusercontent.com/WFCD/warframe-worldstate-data/master/data/solNodes.json';
 const REGIONS_URL =
   'https://raw.githubusercontent.com/Calamity-inc/warframe-public-export-plus/master/ExportRegions.json';
+const ASSETS_URL =
+  'https://raw.githubusercontent.com/Hikuro-93/duviri-pings/main/assets';
 const STATE_DIR = './.arbitration-state';
 const STATE_PATH = `${STATE_DIR}/state.json`;
 const WEBHOOK_URL = process.env.ARBITRATION_WEBHOOK_URL;
@@ -40,25 +42,49 @@ const TIERS = {
   ClanNode4: 'D', SolNode125: 'D',
 };
 
-// Embed styling per tier.
+// Embed styling per tier. S gold, A silver, B bronze; C, D, F are all a muted
+// slate blue so low ranks read as unremarkable rather than alarming.
 const TIER_COLORS = {
   S: 0xD4AF37, // gold
-  A: 0x2ECC71, // green
-  B: 0x3498DB, // blue
-  C: 0x99AAB5, // silver
-  D: 0xE67E22, // orange
-  F: 0x992D22, // dark red
+  A: 0xC0C0C0, // silver
+  B: 0xCD7F32, // bronze
+  C: 0x546E7A, // slate blue
+  D: 0x546E7A, // slate blue
+  F: 0x546E7A, // slate blue
 };
-const TIER_EMOJI = { S: '🅢', A: '🅐', B: '🅑', C: '🅒', D: '🅓', F: '🅕' };
 
-// Faction emblems hosted on the official Warframe wiki.
-const FACTION_LOGOS = {
-  FC_GRINEER: 'https://wiki.warframe.com/images/Grineer.png',
-  FC_CORPUS: 'https://wiki.warframe.com/images/Corpus.png',
-  FC_INFESTATION: 'https://wiki.warframe.com/images/Infestation.png',
-  FC_OROKIN: 'https://wiki.warframe.com/images/OrokinEmblem.png',
-  FC_MITW: 'https://wiki.warframe.com/images/Murmur.png',
+// Rank badge thumbnails (self-hosted in this repo's assets folder).
+const BADGE_URLS = {
+  S: `${ASSETS_URL}/rank-s.png`,
+  A: `${ASSETS_URL}/rank-a.png`,
+  B: `${ASSETS_URL}/rank-b.png`,
+  C: `${ASSETS_URL}/rank-c.png`,
+  D: `${ASSETS_URL}/rank-d.png`,
+  F: `${ASSETS_URL}/rank-f.png`,
 };
+
+// Mission type emoji, matching the fissure pings for a consistent look.
+const MISSION_EMOJI = {
+  survival: '⏳',
+  defense: '🛡️',
+  interception: '📡',
+  disruption: '⚡',
+  'infested-salvage': '🧬',
+  'void-cascade': '🌪️',
+};
+
+// Faction glyphs. Infested uses the green emblem recreation hosted in assets;
+// swap for 'https://wiki.warframe.com/images/IconInfested%28xWhite%29.png'
+// (official white version) if you ever prefer it.
+const FACTION_GLYPHS = {
+  FC_GRINEER: 'https://wiki.warframe.com/images/GrineerGlyph.png',
+  FC_CORPUS: 'https://wiki.warframe.com/images/CorpusGlyph.png',
+  FC_INFESTATION: `${ASSETS_URL}/infested-emblem.png`,
+  FC_OROKIN: 'https://wiki.warframe.com/images/IconOrokinOn%28xWhite%29.png',
+  FC_MITW: 'https://wiki.warframe.com/images/TheMurmurIconColor.png',
+};
+const KUVA_GLYPH = 'https://wiki.warframe.com/images/KuvaGlyph.png';
+
 const FACTION_NAMES = {
   FC_GRINEER: 'Grineer',
   FC_CORPUS: 'Corpus',
@@ -98,6 +124,20 @@ function nodeInfo(nodeId, solNodes, regions) {
       ? Math.round(r.darkSectorData.resourceBonus * 100)
       : null;
   return { type, name, enemy, faction: r.faction, bonus };
+}
+
+// Display name + author glyph for a node. Kuva Fortress and Zariman report
+// plain Grineer in the data, so those get the Kuva glyph by node name.
+function factionInfo(info) {
+  if (/Kuva Fortress|Zariman/i.test(info.name)) {
+    return { name: 'Kuva Grineer', icon: KUVA_GLYPH };
+  }
+  const icon = info.faction ? FACTION_GLYPHS[info.faction] : null;
+  const name =
+    info.enemy && info.enemy !== 'Unknown'
+      ? info.enemy
+      : FACTION_NAMES[info.faction] || 'Unknown';
+  return { name, icon };
 }
 
 async function fetchText(url) {
@@ -176,11 +216,16 @@ async function main() {
     return;
   }
 
-  if (TRACKED.has(slugFor(info.type))) {
+  const slug = slugFor(info.type);
+  if (TRACKED.has(slug)) {
     const tier = TIERS[nodeId] || 'F';
     const endUnix = currentHour + 3600;
+    const faction = factionInfo(info);
 
-    const fields = [{ name: 'Enemy', value: info.enemy, inline: true }];
+    const fields = [
+      { name: 'Tier', value: tier, inline: true },
+      { name: 'Enemy', value: faction.name, inline: true },
+    ];
     if (info.bonus) {
       fields.push({ name: 'Resource bonus', value: `+${info.bonus}%`, inline: true });
     }
@@ -188,19 +233,22 @@ async function main() {
     if (next) {
       const ni = nodeInfo(next[1], solNodes, regions);
       const nt = TIERS[next[1]] || 'F';
-      fields.push({ name: 'Next up', value: `${TIER_EMOJI[nt]} ${ni.name} — ${ni.type}` });
+      fields.push({ name: 'Next up', value: `${nt} · ${ni.name} — ${ni.type}` });
     }
 
     const embed = {
-      title: `${TIER_EMOJI[tier]} ${info.name} — ${info.type}`,
+      title: `${MISSION_EMOJI[slug] || '🔥'} ${info.name} — ${info.type}`,
       color: TIER_COLORS[tier],
       description: `Ends <t:${endUnix}:t> (<t:${endUnix}:R>).`,
       fields,
       timestamp: new Date().toISOString(),
-      footer: { text: 'Rotation data: browse.wf · Tier ratings: Arbitration Goons' },
+      footer: {
+        text:
+          'Rotation data: browse.wf · Tier ratings: [Arbitration Tierlist](https://discord.com/channels/1100168231207059456/1112352988955160657)',
+      },
+      author: faction.icon ? { name: faction.name, icon_url: faction.icon } : undefined,
+      thumbnail: { url: BADGE_URLS[tier] },
     };
-    const logo = FACTION_LOGOS[info.faction];
-    if (logo) embed.thumbnail = { url: logo };
 
     await postEmbed(embed);
     console.log(`Posted embed: ${info.type} @ ${info.name} (${tier} tier)`);
