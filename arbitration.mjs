@@ -1,22 +1,24 @@
-// SANC arbitration poller.
-// Posts to #arbitrations when the current arbitration's mission type is
-// tracked. DE does not publish arbitrations in the worldstate, so data
-// comes from browse.wf's datamined arbitration schedule instead.
-// Tier ratings are credited to the Arbitration Goons community.
+// SANC arbitration poller — embed edition.
+// Posts a rich embed to #arbitrations when the current arbitration's mission
+// type is tracked. DE does not publish arbitrations in the worldstate, so the
+// rotation comes from browse.wf's datamined schedule. Node names come from
+// WFCD's worldstate data; tier ratings are credited to the Arbitration Goons.
 
 import { promises as fs } from 'node:fs';
 
 const ARBYS_URL =
   'https://raw.githubusercontent.com/calamity-inc/browse.wf/senpai/arbys.txt';
+const SOLNODES_URL =
+  'https://raw.githubusercontent.com/WFCD/warframe-worldstate-data/master/data/solNodes.json';
 const REGIONS_URL =
   'https://raw.githubusercontent.com/Calamity-inc/warframe-public-export-plus/master/ExportRegions.json';
 const STATE_DIR = './.arbitration-state';
 const STATE_PATH = `${STATE_DIR}/state.json`;
 const WEBHOOK_URL = process.env.ARBITRATION_WEBHOOK_URL;
 
-// Mission types that trigger a ping.
+// Mission types that trigger a ping. Mirror Defense is deliberately excluded.
 const TRACKED = new Set([
-  'survival',          // also covers Conjunction Survival on Lua
+  'survival',            // also covers Conjunction Survival
   'defense',
   'interception',
   'disruption',
@@ -24,7 +26,7 @@ const TRACKED = new Set([
   'void-cascade',
 ]);
 
-// Node tiers (Arbitration Goons data, mirrored from browse.wf).
+// Node tiers (Arbitration Goons data, mirrored by browse.wf).
 const TIERS = {
   SolNode450: 'S', SolNode106: 'S', SolNode25: 'S', SolNode719: 'S', SolNode64: 'S',
   SolNode147: 'A', SolNode23: 'A', SolNode172: 'A',
@@ -38,49 +40,64 @@ const TIERS = {
   ClanNode4: 'D', SolNode125: 'D',
 };
 
-const FACTIONS = {
+// Embed styling per tier.
+const TIER_COLORS = {
+  S: 0xD4AF37, // gold
+  A: 0x2ECC71, // green
+  B: 0x3498DB, // blue
+  C: 0x99AAB5, // silver
+  D: 0xE67E22, // orange
+  F: 0x992D22, // dark red
+};
+const TIER_EMOJI = { S: '🅢', A: '🅐', B: '🅑', C: '🅒', D: '🅓', F: '🅕' };
+
+// Faction emblems hosted on the official Warframe wiki.
+const FACTION_LOGOS = {
+  FC_GRINEER: 'https://wiki.warframe.com/images/Grineer.png',
+  FC_CORPUS: 'https://wiki.warframe.com/images/Corpus.png',
+  FC_INFESTATION: 'https://wiki.warframe.com/images/Infestation.png',
+  FC_OROKIN: 'https://wiki.warframe.com/images/OrokinEmblem.png',
+  FC_MITW: 'https://wiki.warframe.com/images/Murmur.png',
+};
+const FACTION_NAMES = {
   FC_GRINEER: 'Grineer',
   FC_CORPUS: 'Corpus',
-  FC_INFESTATION: 'Infestation',
-  FC_OROKIN: 'Orokin',
+  FC_INFESTATION: 'Infested',
+  FC_OROKIN: 'Corrupted',
   FC_MITW: 'The Murmur',
   FC_SENTIENT: 'Sentients',
 };
 
-const MISSION_LABELS = {
-  MT_SURVIVAL: 'Survival',
-  MT_DEFENSE: 'Defense',
-  MT_TERRITORY: 'Interception',
-  MT_EXCAVATE: 'Excavation',
-  MT_PURIFY: 'Infested Salvage',
-  MT_EVACUATION: 'Defection',
-  MT_ARTIFACT: 'Disruption',
-  MT_CORRUPTION: 'Void Flood',
-  MT_VOID_CASCADE: 'Void Cascade',
-  MT_ARMAGEDDON: 'Void Armageddon',
-  MT_ALCHEMY: 'Alchemy',
-};
-
-// Cosmetic fixes for names the generic split cannot render exactly.
+// Fallback name cleanup if solNodes ever misses an entry.
 const NAME_FIXES = {
   VPrime: 'V Prime',
   'Kala Azar': 'Kala-azar',
   Kalaazar: 'Kala-azar',
   Stofler: 'Stöfler',
 };
-
-function cleanName(languageKey) {
+function fallbackName(languageKey) {
   const raw = String(languageKey || '').split('/').pop() || '???';
   const spaced = raw.replace(/([a-z0-9])([A-Z])/g, '$1 $2');
   return NAME_FIXES[spaced] || spaced;
 }
 
-function classify(node) {
-  const key = String(node.missionName || '').split('/').pop().toLowerCase();
-  if (key.includes('mirror')) return { slug: 'mirror-defense', label: 'Mirror Defense' };
-  if (key.includes('conjunction')) return { slug: 'survival', label: 'Conjunction Survival' };
-  const label = MISSION_LABELS[node.missionType] || String(node.missionType || 'Unknown');
-  return { slug: label.toLowerCase().replace(/\s+/g, '-'), label };
+function slugFor(type) {
+  const t = String(type || '').toLowerCase();
+  if (t.includes('conjunction')) return 'survival';
+  return t.replace(/[^a-z]/g, '-').replace(/-+/g, '-');
+}
+
+function nodeInfo(nodeId, solNodes, regions) {
+  const s = solNodes[nodeId] || {};
+  const r = regions[nodeId] || {};
+  const type = s.type || fallbackName(r.missionName) || 'Unknown';
+  const name = s.value || `${fallbackName(r.name)} (${fallbackName(r.systemName)})`;
+  const enemy = s.enemy || FACTION_NAMES[r.faction] || 'Unknown';
+  const bonus =
+    r.darkSectorData && r.darkSectorData.resourceBonus
+      ? Math.round(r.darkSectorData.resourceBonus * 100)
+      : null;
+  return { type, name, enemy, faction: r.faction, bonus };
 }
 
 async function fetchText(url) {
@@ -90,8 +107,7 @@ async function fetchText(url) {
 }
 
 async function fetchJson(url) {
-  const text = await fetchText(url);
-  return JSON.parse(text);
+  return JSON.parse(await fetchText(url));
 }
 
 async function readState() {
@@ -107,11 +123,11 @@ async function writeState(state) {
   await fs.writeFile(STATE_PATH, JSON.stringify(state));
 }
 
-async function post(content) {
+async function postEmbed(embed) {
   const res = await fetch(WEBHOOK_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ embeds: [embed] }),
   });
   if (res.status !== 204) throw new Error(`Webhook responded with HTTP ${res.status}`);
 }
@@ -119,8 +135,9 @@ async function post(content) {
 async function main() {
   if (!WEBHOOK_URL) throw new Error('ARBITRATION_WEBHOOK_URL is not set');
 
-  const [arbysText, regions] = await Promise.all([
+  const [arbysText, solNodes, regions] = await Promise.all([
     fetchText(ARBYS_URL),
+    fetchJson(SOLNODES_URL),
     fetchJson(REGIONS_URL),
   ]);
 
@@ -146,20 +163,12 @@ async function main() {
   }
 
   const nodeId = entries[index][1];
-  const node = regions[nodeId] || {};
-  const mission = classify(node);
-  const place = `${cleanName(node.name)}, ${cleanName(node.systemName)}`;
-  const faction = FACTIONS[node.faction] || node.faction || 'Unknown';
-
-  const extras = [`${TIERS[nodeId] || 'F'} tier`];
-  if (node.darkSectorData && node.darkSectorData.resourceBonus) {
-    extras.push(`${Math.round(node.darkSectorData.resourceBonus * 100)}% resource bonus`);
-  }
+  const info = nodeInfo(nodeId, solNodes, regions);
 
   const state = await readState();
   if (!state) {
     await writeState({ lastHour: currentHour });
-    console.log(`First run: baseline recorded for ${mission.label} @ ${place}. No ping sent.`);
+    console.log(`First run: baseline recorded for ${info.type} @ ${info.name}. No ping sent.`);
     return;
   }
   if (currentHour <= state.lastHour) {
@@ -167,22 +176,36 @@ async function main() {
     return;
   }
 
-  if (TRACKED.has(mission.slug)) {
-    const ends = new Date((currentHour + 3600) * 1000);
-    const endsAt = `${String(ends.getUTCHours()).padStart(2, '0')}:00 UTC`;
-    let nextLine = '';
+  if (TRACKED.has(slugFor(info.type))) {
+    const tier = TIERS[nodeId] || 'F';
+    const endUnix = currentHour + 3600;
+
+    const fields = [{ name: 'Enemy', value: info.enemy, inline: true }];
+    if (info.bonus) {
+      fields.push({ name: 'Resource bonus', value: `+${info.bonus}%`, inline: true });
+    }
     const next = entries[index + 1];
     if (next) {
-      const nextNode = regions[next[1]] || {};
-      const nextMission = classify(nextNode);
-      nextLine = ` Next: ${nextMission.label} @ ${cleanName(nextNode.name)}, ${cleanName(nextNode.systemName)}.`;
+      const ni = nodeInfo(next[1], solNodes, regions);
+      const nt = TIERS[next[1]] || 'F';
+      fields.push({ name: 'Next up', value: `${TIER_EMOJI[nt]} ${ni.name} — ${ni.type}` });
     }
-    await post(
-      `Arbitration now live: ${mission.label} — ${faction} @ ${place} (${extras.join(', ')}). Ends ${endsAt}.${nextLine}`
-    );
-    console.log(`Posted: ${mission.label} @ ${place}`);
+
+    const embed = {
+      title: `${TIER_EMOJI[tier]} ${info.name} — ${info.type}`,
+      color: TIER_COLORS[tier],
+      description: `Ends <t:${endUnix}:t> (<t:${endUnix}:R>).`,
+      fields,
+      timestamp: new Date().toISOString(),
+      footer: { text: 'Rotation data: browse.wf · Tier ratings: Arbitration Goons' },
+    };
+    const logo = FACTION_LOGOS[info.faction];
+    if (logo) embed.thumbnail = { url: logo };
+
+    await postEmbed(embed);
+    console.log(`Posted embed: ${info.type} @ ${info.name} (${tier} tier)`);
   } else {
-    console.log(`${mission.label} @ ${place} is not tracked. No ping.`);
+    console.log(`${info.type} @ ${info.name} is not tracked. No ping.`);
   }
 
   await writeState({ lastHour: currentHour });
