@@ -1,0 +1,67 @@
+name: Fissures (Steel Path)
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  starchart:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: fissures-sp
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: .fissures-sp-state
+          key: fissures-sp-state-${{ github.run_id }}
+          restore-keys: |
+            fissures-sp-state-
+
+      - name: Poll fissures
+        run: node fissures.mjs
+        env:
+          FISSURE_MODE: sp
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          FISSURE_CHANNEL_ID: ${{ secrets.FISSURE_CHANNEL_ID }}
+          FISSURE_WEBHOOK_URL: ${{ secrets.FISSURE_WEBHOOK_URL }}
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .fissures-sp-state
+          key: fissures-sp-state-${{ github.run_id }}
+
+  railjack:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: fissures-storm
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: .fissures-storm-state
+          key: fissures-storm-state-${{ github.run_id }}
+          restore-keys: |
+            fissures-storm-state-
+
+      - name: Poll storms
+        run: node fissures.mjs
+        env:
+          FISSURE_MODE: storm
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          FISSURE_RJ_CHANNEL_ID: ${{ secrets.FISSURE_RJ_CHANNEL_ID }}
+          FISSURE_RJ_WEBHOOK_URL: ${{ secrets.FISSURE_RJ_WEBHOOK_URL }}
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .fissures-storm-state
+          key: fissures-storm-state-${{ github.run_id }}
