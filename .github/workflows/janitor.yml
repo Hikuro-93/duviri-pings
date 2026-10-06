@@ -1,0 +1,22 @@
+name: Channel janitor
+
+on:
+  schedule:
+    - cron: '20 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prune stale pings
+        run: node janitor.mjs
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          JANITOR_CHANNEL_IDS: ${{ secrets.JANITOR_CHANNEL_IDS }}
+          JANITOR_MAX_AGE_HOURS: '12'
