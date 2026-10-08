@@ -53,10 +53,15 @@ async function sweepChannel(channelId) {
     });
 
     if (stale.length > 0) {
-      await req(`${DISCORD}/channels/${channelId}/messages/bulk-delete`, {
-        method: 'POST',
-        body: { messages: stale.map((m) => m.id) },
-      });
+      if (stale.length === 1) {
+        // The bulk endpoint only accepts 2-100 messages; single-delete for one.
+        await req(`${DISCORD}/channels/${channelId}/messages/${stale[0].id}`, { method: 'DELETE' });
+      } else {
+        await req(`${DISCORD}/channels/${channelId}/messages/bulk-delete`, {
+          method: 'POST',
+          body: { messages: stale.map((m) => m.id) },
+        });
+      }
       deleted += stale.length;
     }
 
