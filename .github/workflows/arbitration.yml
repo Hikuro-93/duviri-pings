@@ -15,22 +15,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/cache/restore@v4
-        with:
-          path: .arbitration-state
-          key: arbitration-state-${{ github.run_id }}
-          restore-keys: arbitration-state
-
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          ARBITRATION_CHANNEL_ID: ${{ secrets.ARBITRATION_CHANNEL_ID }}
           ARBITRATION_WEBHOOK_URL: ${{ secrets.ARBITRATION_WEBHOOK_URL }}
         run: node arbitration.mjs
-
-      - uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: .arbitration-state
-          key: arbitration-state-${{ github.run_id }}
