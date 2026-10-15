@@ -1,66 +1,55 @@
 #!/usr/bin/env node
-// Steel Path fissure poller with reaction-menu boards.
-// Modes:
-//   FISSURE_MODE=sp    -> Steel Path starchart fissures (isHard && !isStorm)
-//   FISSURE_MODE=storm -> Void Storms (isStorm; the API never marks storms as
-//                        hard because the same storm entry serves normal and
-//                        Steel Path, SP is selected when launching it)
-// No dependencies. Node 20+ (global fetch).
+// Planet-targeted Steel Path fissure poller with a reaction board.
+// Serves Discord channel: 🪐fissures-perplanet-sp
+// Stateless by design: the board is found via its marker text in channel
+// history, and already-pinged fissure IDs are recovered from past embeds,
+// so nothing needs to survive between (ephemeral) Actions runs.
 
-import fs from 'node:fs';
-import path from 'node:path';
-
-const MODE = process.env.FISSURE_MODE === 'storm' ? 'storm' : 'sp';
 const API = 'https://api.warframestat.us/pc/fissures';
 const DISCORD = 'https://discord.com/api/v10';
 
 const BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
-const CHANNEL_ID = MODE === 'storm' ? process.env.FISSURE_RJ_CHANNEL_ID : process.env.FISSURE_CHANNEL_ID;
-const WEBHOOK_URL = (MODE === 'storm' ? process.env.FISSURE_RJ_WEBHOOK_URL : process.env.FISSURE_WEBHOOK_URL || '').replace(/\/+$/, '');
+const CHANNEL_ID = process.env.PLANET_FISSURES_CHANNEL_ID;
+const WEBHOOK_URL = (process.env.PLANET_FISSURES_WEBHOOK_URL || '').replace(/\/+$/, '');
 
 if (!BOT_TOKEN || !CHANNEL_ID || !WEBHOOK_URL) {
-  console.error(`Missing env vars for mode "${MODE}": DISCORD_BOT_TOKEN + ${MODE === 'storm' ? 'FISSURE_RJ_CHANNEL_ID, FISSURE_RJ_WEBHOOK_URL' : 'FISSURE_CHANNEL_ID, FISSURE_WEBHOOK_URL'}`);
+  console.error('Missing env vars: DISCORD_BOT_TOKEN, PLANET_FISSURES_CHANNEL_ID, PLANET_FISSURES_WEBHOOK_URL');
   process.exit(1);
 }
 
-// ---------- categories (reaction board) ----------
+const BOARD_MARKER = '🪙 Planet Fissure board';
 
-// Starchart SP fissures. Void Armageddon is excluded: fissures on Zariman only
-// ever roll Void Flood (Everview Arc) and Void Cascade (Tuvul Commons), both
-// Omnia. Alchemy and the Lua/Deimos Omnia survivals roll under existing types.
-const SP_CATEGORIES = [
-  ['capture', 'Capture', '🎯'],
-  ['extermination', 'Extermination', '💀'],
-  ['rescue', 'Rescue', '🛟'],
-  ['sabotage', 'Sabotage', '💣'],
-  ['survival', 'Survival', '⏳'],
-  ['defense', 'Defense', '🛡️'],
-  ['excavation', 'Excavation', '⛏️'],
-  ['interception', 'Interception', '📡'],
-  ['spy', 'Spy', '👁️'],
-  ['mobile-defense', 'Mobile Defense', '🖥️'],
-  ['disruption', 'Disruption', '⚡'],
-  ['void-cascade', 'Void Cascade', '🌪️'],
-  ['void-flood', 'Void Flood', '🌊'],
-  ['alchemy', 'Alchemy', '⚗️'],
-  ['kuva-survival', 'Kuva Survival', '🩸'],
+// Endless mission types (normalized: lowercase letters only).
+const ENDLESS = new Set([
+  'survival', 'defense', 'excavation', 'interception',
+  'disruption', 'voidcascade', 'alchemy', 'kuvasurvival', 'infestedsalvage',
+]);
+
+const MISSION_EMOJI = {
+  survival: '⏳', defense: '🛡️', excavation: '⛏️', interception: '📡',
+  disruption: '⚡', voidcascade: '🌪️', alchemy: '⚗️', kuvasurvival: '🩸',
+  infestedsalvage: '🧬',
+};
+
+const PLANETS = [
+  ['Eris', 'Eris', '🦠'],
+  ['Deimos', 'Deimos', '🧫'],
+  ['Sedna', 'Sedna', '🥊'],
+  ['Kuva Fortress', 'Kuva Fortress', '🩸'],
+  ['Lua', 'Lua', '🌙'],
+  ['Zariman', 'Zariman', '🌀'],
+  ['Void', 'Void', '🕳️'],
+  ['Jupiter', 'Jupiter', '⚡'],
+  ['Saturn', 'Saturn', '🪐'],
+  ['Ceres', 'Ceres', '🏗️'],
+  ['Pluto', 'Pluto', '❄️'],
+  ['Neptune', 'Neptune', '🌊'],
+  ['Uranus', 'Uranus', '🛸'],
+  ['Europa', 'Europa', '🧊'],
+  ['Mars', 'Mars', '🔴'],
+  ['Venus', 'Venus', '🌫️'],
+  ['Earth', 'Earth', '🌍'],
 ];
-
-// Void Storms only ever roll these mission types (confirmed from live data).
-const STORM_CATEGORIES = [
-  ['skirmish', 'Skirmish', '🚀'],
-  ['volatile', 'Volatile', '☢️'],
-  ['extermination', 'Extermination', '💀'],
-  ['survival', 'Survival', '⏳'],
-];
-
-const CATEGORIES = MODE === 'storm' ? STORM_CATEGORIES : SP_CATEGORIES;
-
-// Bump when category lists change: the old board gets deleted and re-created
-// so stale reactions disappear. Users must re-click their toggles.
-const BOARD_VERSION = 2;
-
-// ---------- eras (color bar + relic icon thumbnail) ----------
 
 const ERAS = {
   lith: { name: 'Lith', color: 0x9C7A54, icon: 'https://wiki.warframe.com/images/LithRelicIntact.png' },
@@ -68,13 +57,9 @@ const ERAS = {
   neo: { name: 'Neo', color: 0xD9B829, icon: 'https://wiki.warframe.com/images/NeoRelicIntact.png' },
   axi: { name: 'Axi', color: 0xC0392B, icon: 'https://wiki.warframe.com/images/AxiRelicIntact.png' },
   requiem: { name: 'Requiem', color: 0x7E3FA4, icon: 'https://wiki.warframe.com/images/RequiemRelicIntact.png' },
-  omnia: { name: 'Omnia', color: 0x2FA8C5, icon: null }, // no standalone Omnia relic icon exists
+  omnia: { name: 'Omnia', color: 0x2FA8C5, icon: null },
 };
 
-// ---------- factions (author glyph per ping) ----------
-
-// Green recreation of the in-game emblem, self-hosted in this repo's assets.
-// Official white alternative: 'https://wiki.warframe.com/images/IconInfested%28xWhite%29.png'
 const INFESTED_GLYPH = 'https://raw.githubusercontent.com/Hikuro-93/duviri-pings/main/assets/infested-emblem.png';
 
 const FACTION_GLYPHS = {
@@ -89,25 +74,10 @@ const FACTION_GLYPHS = {
 };
 
 function factionOf(f) {
-  // Kuva Fortress and Zariman report plain "Grineer" in the data; show the Kuva glyph there.
   if (/Kuva Fortress|Zariman/.test(f.node || '')) {
     return { name: 'Kuva Grineer', icon: 'https://wiki.warframe.com/images/KuvaGlyph.png' };
   }
   return FACTION_GLYPHS[f.enemy] || { name: f.enemy, icon: null };
-}
-
-// ---------- state ----------
-
-const stateDir = `.fissures-${MODE}-state`;
-const boardFile = path.join(stateDir, 'board.json');
-const seenFile = path.join(stateDir, 'seen.json');
-
-function loadJson(file, fallback) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
-}
-function saveJson(file, data) {
-  fs.mkdirSync(stateDir, { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
 }
 
 // ---------- discord helpers ----------
@@ -131,63 +101,67 @@ async function req(url, { method = 'GET', body, bot = false } = {}) {
   return text ? JSON.parse(text) : null;
 }
 
-async function messageExists(messageId) {
-  const res = await fetch(`${DISCORD}/channels/${CHANNEL_ID}/messages/${messageId}`, {
-    headers: { Authorization: `Bot ${BOT_TOKEN}` },
-  });
-  if (res.ok) return true;
-  if (res.status === 404) return false;
-  throw new Error(`GET board message -> ${res.status}`);
-}
-
-// ---------- board ----------
+// ---------- board (stateless: found by marker, pinned, duplicates removed) ----------
 
 function boardContent(enabled) {
-  const lines = CATEGORIES.map(([key, label, emoji]) => `${emoji} ${label} — ${enabled.has(key) ? 'ON' : 'OFF'}`);
+  const lines = PLANETS.map(([key, label, emoji]) => `${emoji} ${label} — ${enabled.has(key) ? 'ON' : 'OFF'}`);
   return [
-    `🪙 Steel Path ${MODE === 'storm' ? 'Void Storm' : 'Fissure'} board — click a reaction below to toggle that mission type`,
-    'React = pinged for every newly spawned matching fissure. Remove your reaction = silent again.',
-    'Toggles only apply to fissures that spawn after you click. Nothing retroactive.',
+    `${BOARD_MARKER} (🪐fissures-perplanet-sp) — click a planet's reaction to get pinged for every newly spawned ENDLESS SP fissure there`,
+    'Only endless missions. Remove your reaction = silent again. Toggles apply to fissures spawning after you click.',
     '',
     ...lines,
   ].join('\n');
 }
 
 async function ensureBoard() {
-  const boardState = loadJson(boardFile, {});
-  let messageId = boardState.messageId;
+  const messages = await req(`${DISCORD}/channels/${CHANNEL_ID}/messages?limit=100`, { bot: true });
+  const boards = (messages || []).filter((m) => (m.content || '').includes(BOARD_MARKER));
 
-  // Category lists changed since this board was built: delete it and start fresh.
-  if (messageId && boardState.version !== BOARD_VERSION) {
-    await req(`${WEBHOOK_URL}/messages/${messageId}`, { method: 'DELETE' }).catch(() => {});
-    messageId = null;
-  }
-  if (messageId && !(await messageExists(messageId))) messageId = null;
-
-  if (!messageId) {
+  if (boards.length === 0) {
     const msg = await req(`${WEBHOOK_URL}?wait=true`, { method: 'POST', body: { content: boardContent(new Set()) } });
-    messageId = msg.id;
-    saveJson(boardFile, { messageId, version: BOARD_VERSION });
-    console.log(`Created board message ${messageId} (version ${BOARD_VERSION})`);
+    boards.push(msg);
+    console.log(`Created board message ${msg.id}`);
   }
 
-  // Seed one reaction per category (idempotent), so users just click.
-  // Discord caps reaction adds at 1 per 0.25s per channel, so pace them.
-  for (const [, , emoji] of CATEGORIES) {
-    await req(`${DISCORD}/channels/${CHANNEL_ID}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}/@me`, { method: 'PUT', bot: true });
+  // Remove duplicate boards left by earlier runs (keep the newest).
+  for (const stale of boards.slice(1)) {
+    await req(`${DISCORD}/channels/${CHANNEL_ID}/messages/${stale.id}`, { method: 'DELETE', bot: true }).catch(() => {});
+    console.log(`Deleted stale board ${stale.id}`);
+  }
+
+  const boardId = boards[0].id;
+
+  // Pin the board so the janitor never sweeps it.
+  await req(`${DISCORD}/channels/${CHANNEL_ID}/pins/${boardId}`, { method: 'PUT', bot: true }).catch(() => {});
+
+  // Seed one reaction per planet (idempotent). Pace for Discord's rate limits.
+  for (const [, , emoji] of PLANETS) {
+    await req(`${DISCORD}/channels/${CHANNEL_ID}/messages/${boardId}/reactions/${encodeURIComponent(emoji)}/@me`, { method: 'PUT', bot: true });
     await new Promise((r) => setTimeout(r, 350));
   }
 
-  // A category is enabled if any non-bot user reacted.
   const enabled = new Set();
-  for (const [key, , emoji] of CATEGORIES) {
-    const users = await req(`${DISCORD}/channels/${CHANNEL_ID}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}?limit=100`, { bot: true });
+  for (const [key, , emoji] of PLANETS) {
+    const users = await req(`${DISCORD}/channels/${CHANNEL_ID}/messages/${boardId}/reactions/${encodeURIComponent(emoji)}?limit=100`, { bot: true });
     if (users.some((u) => !u.bot)) enabled.add(key);
   }
 
-  // Reflect current toggles on the board.
-  await req(`${WEBHOOK_URL}/messages/${messageId}`, { method: 'PATCH', body: { content: boardContent(enabled) } });
+  await req(`${WEBHOOK_URL}/messages/${boardId}`, { method: 'PATCH', body: { content: boardContent(enabled) } });
   return enabled;
+}
+
+// ---------- seen IDs recovered from our own past pings ----------
+
+async function seenFromHistory() {
+  const messages = await req(`${DISCORD}/channels/${CHANNEL_ID}/messages?limit=50`, { bot: true });
+  const ids = new Set();
+  for (const m of messages || []) {
+    for (const e of m.embeds || []) {
+      const match = ((e.footer && e.footer.text) || '').match(/id:([A-Za-z0-9]+)/);
+      if (match) ids.add(match[1]);
+    }
+  }
+  return ids;
 }
 
 // ---------- fissures ----------
@@ -196,10 +170,9 @@ function normalizeMission(s) {
   return String(s || '').toLowerCase().replace(/[^a-z]/g, '');
 }
 
-function categoryOf(f) {
-  const norm = normalizeMission(f.missionType);
-  if (norm.startsWith('kuva') && norm !== 'kuvasurvival') return null; // other Kuva missions untracked
-  return CATEGORIES.find(([key]) => normalizeMission(key) === norm)?.[0] ?? null;
+function planetOf(f) {
+  const m = String(f.node || '').match(/\(([^()]+)\)\s*$/);
+  return m ? m[1] : null;
 }
 
 function eraOf(f) {
@@ -214,10 +187,9 @@ function toUnix(iso) {
   return Number.isFinite(t) ? Math.floor(t / 1000) : null;
 }
 
-function fissureEmbed(f) {
+function fissureEmbed(f, planet) {
   const era = eraOf(f);
-  const cat = categoryOf(f);
-  const emoji = CATEGORIES.find(([key]) => key === cat)?.[2] || '🪙';
+  const emoji = MISSION_EMOJI[normalizeMission(f.missionType)] || '🪙';
   const expiry = toUnix(f.expiry);
   const faction = factionOf(f);
   return {
@@ -228,9 +200,9 @@ function fissureEmbed(f) {
     author: faction.icon ? { name: faction.name, icon_url: faction.icon } : undefined,
     fields: [
       { name: 'Expires', value: expiry ? `<t:${expiry}:R> (<t:${expiry}:t>)` : 'unknown', inline: true },
-      { name: 'Faction', value: faction.name || 'Unknown', inline: true },
+      { name: 'Planet', value: planet, inline: true },
     ],
-    footer: { text: MODE === 'storm' ? 'Steel Path Void Storm' : 'Steel Path Fissure' },
+    footer: { text: `Steel Path Endless Fissure • id:${f.id}` },
     timestamp: f.activation || new Date().toISOString(),
   };
 }
@@ -239,30 +211,26 @@ function fissureEmbed(f) {
 
 async function main() {
   const enabled = await ensureBoard();
+  const seenSet = await seenFromHistory();
+
   const fissures = await req(API);
   if (!Array.isArray(fissures)) throw new Error('Unexpected API response');
 
-  // Starchart: SP fissures only. Storms: the API never flags storms as hard
-  // (SP is chosen when launching), so all storm entries are relevant.
   const relevant = fissures.filter((f) =>
-    MODE === 'storm' ? f.isStorm : (f.isHard && !f.isStorm),
+    f.isHard && !f.isStorm && ENDLESS.has(normalizeMission(f.missionType)),
   );
 
-  const activeIds = new Set(relevant.map((f) => f.id));
-  const seenSet = new Set(loadJson(seenFile, []).filter((id) => activeIds.has(id)));
-
-  // Ping only fissures that are new since last run AND whose category is enabled.
-  const fresh = relevant.filter((f) => !seenSet.has(f.id) && enabled.has(categoryOf(f)));
+  const fresh = relevant.filter((f) => !seenSet.has(f.id));
 
   for (const f of fresh) {
-    await req(WEBHOOK_URL, { method: 'POST', body: { embeds: [fissureEmbed(f)] } });
-    console.log(`Posted: ${f.missionType} — ${f.node} (${eraOf(f).name})`);
+    const planet = planetOf(f);
+    if (planet && enabled.has(planet)) {
+      await req(WEBHOOK_URL, { method: 'POST', body: { embeds: [fissureEmbed(f, planet)] } });
+      console.log(`Posted: ${f.missionType} — ${f.node} (${eraOf(f).name})`);
+    }
   }
 
-  // Snapshot every currently active fissure as known, so toggling a category
-  // never retroactively pings fissures that were already up when you clicked.
-  saveJson(seenFile, relevant.map((f) => f.id));
-  console.log(`Mode ${MODE}: ${relevant.length} active ${MODE === 'storm' ? 'void storms' : 'SP fissures'}, ${enabled.size}/${CATEGORIES.length} categories enabled, ${fresh.length} posted this run.`);
+  console.log(`${relevant.length} active endless SP fissures, ${enabled.size}/${PLANETS.length} planets enabled, ${fresh.length} new this run.`);
 }
 
 main().catch((err) => {
