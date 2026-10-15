@@ -1,262 +1,221 @@
-// SANC arbitration poller — embed edition.
-// Posts a rich embed to #arbitrations when the current arbitration's mission
-// type is tracked. DE does not publish arbitrations in the worldstate, so the
-// rotation comes from browse.wf's datamined schedule. Node names come from
-// WFCD's worldstate data; tier ratings are credited to the Arbitration Goons.
+#!/usr/bin/env node
+// Criteria-based Steel Path arbitration ping with reaction boards.
+// Serves Discord channel: 🔥arbitrations
+// Two pinned boards: mission types + planets. A ping fires only when the
+// current arbitration matches BOTH boards' selections (AND across, OR within).
+// Stateless: seen-ID recovered from past embed footers; boards found by marker.
+// Rankings omitted by design (meta calls belong to the clanmates).
 
-import { promises as fs } from 'node:fs';
+const API = 'https://api.warframestat.us/pc/arbitration';
+const DISCORD = 'https://discord.com/api/v10';
 
-const ARBYS_URL =
-  'https://raw.githubusercontent.com/calamity-inc/browse.wf/senpai/arbys.txt';
-const SOLNODES_URL =
-  'https://raw.githubusercontent.com/WFCD/warframe-worldstate-data/master/data/solNodes.json';
-const REGIONS_URL =
-  'https://raw.githubusercontent.com/Calamity-inc/warframe-public-export-plus/master/ExportRegions.json';
-const ASSETS_URL =
-  'https://raw.githubusercontent.com/Hikuro-93/duviri-pings/main/assets';
-const STATE_DIR = './.arbitration-state';
-const STATE_PATH = `${STATE_DIR}/state.json`;
-const WEBHOOK_URL = process.env.ARBITRATION_WEBHOOK_URL;
+const BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
+const CHANNEL_ID = process.env.ARBITRATION_CHANNEL_ID;
+const WEBHOOK_URL = (process.env.ARBITRATION_WEBHOOK_URL || '').replace(/\/+$/, '');
 
-// Mission types that trigger a ping. Mirror Defense is deliberately excluded.
-const TRACKED = new Set([
-  'survival',            // also covers Conjunction Survival
-  'defense',
-  'interception',
-  'disruption',
-  'infested-salvage',
-  'void-cascade',
-]);
+if (!BOT_TOKEN || !CHANNEL_ID || !WEBHOOK_URL) {
+  console.error('Missing env vars: DISCORD_BOT_TOKEN, ARBITRATION_CHANNEL_ID, ARBITRATION_WEBHOOK_URL');
+  process.exit(1);
+}
 
-// Node tiers (Arbitration Goons data, mirrored by browse.wf).
-const TIERS = {
-  SolNode450: 'S', SolNode106: 'S', SolNode25: 'S', SolNode719: 'S', SolNode64: 'S',
-  SolNode147: 'A', SolNode23: 'A', SolNode172: 'A',
-  SolNode167: 'B', ClanNode24: 'B', SolNode149: 'B', ClanNode22: 'B', ClanNode18: 'B',
-  SolNode164: 'B', SolNode707: 'B', SolNode211: 'B', SolNode42: 'B', SolNode195: 'B',
-  SolNode408: 'B', SolNode402: 'B',
-  SolNode412: 'C', ClanNode2: 'C', SolNode46: 'C', ClanNode8: 'C', SolNode212: 'C',
-  SolNode22: 'C', SolNode224: 'C', SolNode26: 'C', ClanNode6: 'C', SolNode122: 'C',
-  SolNode72: 'C',
-  SolNode130: 'D', ClanNode15: 'D', SolNode85: 'D', SolNode18: 'D', SolNode305: 'D',
-  ClanNode4: 'D', SolNode125: 'D',
-};
+const MISSION_BOARD_MARKER = '🔥 Arbitration Mission board';
+const PLANET_BOARD_MARKER = '🌍 Arbitration Planet board';
 
-// Embed styling per tier. S gold, A silver, B bronze; C, D, F are all a muted
-// slate blue so low ranks read as unremarkable rather than alarming.
-const TIER_COLORS = {
-  S: 0xD4AF37, // gold
-  A: 0xC0C0C0, // silver
-  B: 0xCD7F32, // bronze
-  C: 0x546E7A, // slate blue
-  D: 0x546E7A, // slate blue
-  F: 0x546E7A, // slate blue
-};
+// Mission types arbitrations can roll. Add here if DE introduces new ones.
+const MISSIONS = [
+  ['survival', 'Survival', '⏳'],
+  ['interception', 'Interception', '📡'],
+  ['defense', 'Defense', '🛡️'],
+  ['excavation', 'Excavation', '⛏️'],
+  ['disruption', 'Disruption', '⚡'],
+  ['infestedsalvage', 'Infested Salvage', '🧬'],
+  ['deflection', 'Deflection', '🎯'],
+];
 
-// Rank badge thumbnails (self-hosted in this repo's assets folder).
-const BADGE_URLS = {
-  S: `${ASSETS_URL}/rank-s.png`,
-  A: `${ASSETS_URL}/rank-a.png`,
-  B: `${ASSETS_URL}/rank-b.png`,
-  C: `${ASSETS_URL}/rank-c.png`,
-  D: `${ASSETS_URL}/rank-d.png`,
-  F: `${ASSETS_URL}/rank-f.png`,
-};
+const PLANETS = [
+  ['Eris', 'Eris', '🦠'],
+  ['Deimos', 'Deimos', '🧫'],
+  ['Sedna', 'Sedna', '🥊'],
+  ['Kuva Fortress', 'Kuva Fortress', '🩸'],
+  ['Lua', 'Lua', '🌙'],
+  ['Zariman', 'Zariman', '🌀'],
+  ['Void', 'Void', '🕳️'],
+  ['Jupiter', 'Jupiter', '⚡'],
+  ['Saturn', 'Saturn', '🪐'],
+  ['Ceres', 'Ceres', '🏗️'],
+  ['Pluto', 'Pluto', '❄️'],
+  ['Neptune', 'Neptune', '🌊'],
+  ['Uranus', 'Uranus', '🛸'],
+  ['Europa', 'Europa', '🧊'],
+  ['Mars', 'Mars', '🔴'],
+  ['Venus', 'Venus', '🌫️'],
+  ['Earth', 'Earth', '🌍'],
+];
 
-// Mission type emoji, matching the fissure pings for a consistent look.
-const MISSION_EMOJI = {
-  survival: '⏳',
-  defense: '🛡️',
-  interception: '📡',
-  disruption: '⚡',
-  'infested-salvage': '🧬',
-  'void-cascade': '🌪️',
-};
+const INFESTED_GLYPH = 'https://raw.githubusercontent.com/Hikuro-93/duviri-pings/main/assets/infested-emblem.png';
 
-// Faction glyphs. Infested uses the green emblem recreation hosted in assets;
-// swap for 'https://wiki.warframe.com/images/IconInfested%28xWhite%29.png'
-// (official white version) if you ever prefer it.
 const FACTION_GLYPHS = {
-  FC_GRINEER: 'https://wiki.warframe.com/images/GrineerGlyph.png',
-  FC_CORPUS: 'https://wiki.warframe.com/images/CorpusGlyph.png',
-  FC_INFESTATION: `${ASSETS_URL}/infested-emblem.png`,
-  FC_OROKIN: 'https://wiki.warframe.com/images/IconOrokinOn%28xWhite%29.png',
-  FC_MITW: 'https://wiki.warframe.com/images/TheMurmurIconColor.png',
-};
-const KUVA_GLYPH = 'https://wiki.warframe.com/images/KuvaGlyph.png';
-
-const FACTION_NAMES = {
-  FC_GRINEER: 'Grineer',
-  FC_CORPUS: 'Corpus',
-  FC_INFESTATION: 'Infested',
-  FC_OROKIN: 'Corrupted',
-  FC_MITW: 'The Murmur',
-  FC_SENTIENT: 'Sentients',
+  Grineer: { name: 'Grineer', icon: 'https://wiki.warframe.com/images/GrineerGlyph.png' },
+  Corpus: { name: 'Corpus', icon: 'https://wiki.warframe.com/images/CorpusGlyph.png' },
+  Infestation: { name: 'Infestation', icon: INFESTED_GLYPH },
+  Infested: { name: 'Infested', icon: INFESTED_GLYPH },
+  Corrupted: { name: 'Corrupted', icon: 'https://wiki.warframe.com/images/IconOrokinOn%28xWhite%29.png' },
+  Orokin: { name: 'Orokin', icon: 'https://wiki.warframe.com/images/IconOrokinOn%28xWhite%29.png' },
 };
 
-// Fallback name cleanup if solNodes ever misses an entry.
-const NAME_FIXES = {
-  VPrime: 'V Prime',
-  'Kala Azar': 'Kala-azar',
-  Kalaazar: 'Kala-azar',
-  Stofler: 'Stöfler',
-};
-function fallbackName(languageKey) {
-  const raw = String(languageKey || '').split('/').pop() || '???';
-  const spaced = raw.replace(/([a-z0-9])([A-Z])/g, '$1 $2');
-  return NAME_FIXES[spaced] || spaced;
-}
+// ---------- discord helpers ----------
 
-function slugFor(type) {
-  const t = String(type || '').toLowerCase();
-  if (t.includes('conjunction')) return 'survival';
-  return t.replace(/[^a-z]/g, '-').replace(/-+/g, '-');
-}
-
-function nodeInfo(nodeId, solNodes, regions) {
-  const s = solNodes[nodeId] || {};
-  const r = regions[nodeId] || {};
-  const type = s.type || fallbackName(r.missionName) || 'Unknown';
-  const name = s.value || `${fallbackName(r.name)} (${fallbackName(r.systemName)})`;
-  const enemy = s.enemy || FACTION_NAMES[r.faction] || 'Unknown';
-  const bonus =
-    r.darkSectorData && r.darkSectorData.resourceBonus
-      ? Math.round(r.darkSectorData.resourceBonus * 100)
-      : null;
-  return { type, name, enemy, faction: r.faction, bonus };
-}
-
-// Display name + author glyph for a node. Kuva Fortress and Zariman report
-// plain Grineer in the data, so those get the Kuva glyph by node name.
-function factionInfo(info) {
-  if (/Kuva Fortress|Zariman/i.test(info.name)) {
-    return { name: 'Kuva Grineer', icon: KUVA_GLYPH };
+async function req(url, { method = 'GET', body, bot = false } = {}) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (bot) headers.Authorization = `Bot ${BOT_TOKEN}`;
+  const payload = body === undefined ? undefined : JSON.stringify(body);
+  let res = await fetch(url, { method, headers, body: payload });
+  for (let attempt = 0; res.status === 429 && attempt < 5; attempt++) {
+    const data = await res.json().catch(() => ({}));
+    const wait = (data.retry_after ?? 0.5) * 1000 + 50;
+    await new Promise((r) => setTimeout(r, wait));
+    res = await fetch(url, { method, headers, body: payload });
   }
-  const icon = info.faction ? FACTION_GLYPHS[info.faction] : null;
-  const name =
-    info.enemy && info.enemy !== 'Unknown'
-      ? info.enemy
-      : FACTION_NAMES[info.faction] || 'Unknown';
-  return { name, icon };
-}
-
-async function fetchText(url) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`GET ${url} failed with HTTP ${res.status}`);
-  return res.text();
-}
-
-async function fetchJson(url) {
-  return JSON.parse(await fetchText(url));
-}
-
-async function readState() {
-  try {
-    return JSON.parse(await fs.readFile(STATE_PATH, 'utf8'));
-  } catch {
-    return null;
+  if (!res.ok) {
+    const detail = (await res.text().catch(() => '')).slice(0, 300);
+    throw new Error(`${method} ${url} -> ${res.status} ${detail}`);
   }
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
 }
 
-async function writeState(state) {
-  await fs.mkdir(STATE_DIR, { recursive: true });
-  await fs.writeFile(STATE_PATH, JSON.stringify(state));
+// ---------- boards ----------
+
+function boardText(marker, entries, enabled) {
+  const lines = entries.map(([key, label, emoji]) => `${emoji} ${label} — ${enabled.has(key) ? 'ON' : 'OFF'}`);
+  return [`${marker} — react to select. Ping only when the current arbitration matches your mission AND planet picks.`, '', ...lines].join('\n');
 }
 
-async function postEmbed(embed) {
-  const res = await fetch(WEBHOOK_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ embeds: [embed] }),
-  });
-  if (res.status !== 204) throw new Error(`Webhook responded with HTTP ${res.status}`);
+async function ensureBoards() {
+  const messages = await req(`${DISCORD}/channels/${CHANNEL_ID}/messages?limit=100`, { bot: true });
+  const markers = [MISSION_BOARD_MARKER, PLANET_BOARD_MARKER];
+  const found = Object.fromEntries(markers.map((mk) => [mk, []]));
+  for (const m of messages || []) {
+    for (const mk of markers) {
+      if ((m.content || '').includes(mk)) found[mk].push(m);
+    }
+  }
+
+  const defs = [
+    [MISSION_BOARD_MARKER, MISSIONS],
+    [PLANET_BOARD_MARKER, PLANETS],
+  ];
+  const enabledSets = {};
+
+  for (const [marker, entries] of defs) {
+    let boards = found[marker];
+    if (boards.length === 0) {
+      const msg = await req(`${WEBHOOK_URL}?wait=true`, { method: 'POST', body: { content: boardText(marker, entries, new Set()) } });
+      boards = [msg];
+      console.log(`Created ${marker} ${msg.id}`);
+    }
+    // Delete duplicates, keep newest.
+    for (const stale of boards.slice(1)) {
+      await req(`${DISCORD}/channels/${CHANNEL_ID}/messages/${stale.id}`, { method: 'DELETE', bot: true }).catch(() => {});
+      console.log(`Deleted stale ${marker} ${stale.id}`);
+    }
+    const boardId = boards[0].id;
+    await req(`${DISCORD}/channels/${CHANNEL_ID}/pins/${boardId}`, { method: 'PUT', bot: true }).catch(() => {});
+
+    for (const [, , emoji] of entries) {
+      await req(`${DISCORD}/channels/${CHANNEL_ID}/messages/${boardId}/reactions/${encodeURIComponent(emoji)}/@me`, { method: 'PUT', bot: true });
+      await new Promise((r) => setTimeout(r, 350));
+    }
+    const enabled = new Set();
+    for (const [key, , emoji] of entries) {
+      const users = await req(`${DISCORD}/channels/${CHANNEL_ID}/messages/${boardId}/reactions/${encodeURIComponent(emoji)}?limit=100`, { bot: true });
+      if (users.some((u) => !u.bot)) enabled.add(key);
+    }
+    await req(`${WEBHOOK_URL}/messages/${boardId}`, { method: 'PATCH', body: { content: boardText(marker, entries, enabled) } });
+    enabledSets[marker] = enabled;
+  }
+
+  return { missions: enabledSets[MISSION_BOARD_MARKER], planets: enabledSets[PLANET_BOARD_MARKER] };
 }
+
+// ---------- seen ----------
+
+async function seenFromHistory() {
+  const messages = await req(`${DISCORD}/channels/${CHANNEL_ID}/messages?limit=50`, { bot: true });
+  const ids = new Set();
+  for (const m of messages || []) {
+    for (const e of m.embeds || []) {
+      const match = ((e.footer && e.footer.text) || '').match(/id:([A-Za-z0-9]+)/);
+      if (match) ids.add(match[1]);
+    }
+  }
+  return ids;
+}
+
+// ---------- helpers ----------
+
+function norm(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z]/g, '');
+}
+
+function planetOf(node) {
+  const m = String(node || '').match(/\(([^()]+)\)\s*$/);
+  return m ? m[1] : null;
+}
+
+function toUnix(iso) {
+  const t = Date.parse(iso);
+  return Number.isFinite(t) ? Math.floor(t / 1000) : null;
+}
+
+function arbEmbed(a) {
+  const faction = FACTION_GLYPHS[a.enemy] || { name: a.enemy, icon: null };
+  const start = toUnix(a.activation);
+  const end = toUnix(a.expiry);
+  return {
+    title: `🔥 Arbitration — ${a.type}`,
+    description: `${a.node}`,
+    color: 0xE67E22,
+    author: faction.icon ? { name: faction.name, icon_url: faction.icon } : undefined,
+    fields: [
+      { name: 'Starts', value: start ? `<t:${start}:R> (<t:${start}:t>)` : 'unknown', inline: true },
+      { name: 'Ends', value: end ? `<t:${end}:R> (<t:${end}:t>)` : 'unknown', inline: true },
+    ],
+    footer: { text: `Steel Path Arbitration • id:${a.id}` },
+    timestamp: a.activation || new Date().toISOString(),
+  };
+}
+
+// ---------- main ----------
 
 async function main() {
-  if (!WEBHOOK_URL) throw new Error('ARBITRATION_WEBHOOK_URL is not set');
+  const { missions, planets } = await ensureBoards();
+  const seen = await seenFromHistory();
 
-  const [arbysText, solNodes, regions] = await Promise.all([
-    fetchText(ARBYS_URL),
-    fetchJson(SOLNODES_URL),
-    fetchJson(REGIONS_URL),
-  ]);
-
-  const entries = arbysText
-    .split('\n')
-    .map((line) => line.split(','))
-    .filter((parts) => parts.length === 2)
-    .map(([ts, nodeId]) => [parseInt(ts, 10), nodeId.trim()]);
-
-  if (entries.length === 0) throw new Error('arbys.txt is empty or unreadable');
-
-  const epoch = entries[0][0];
-  const currentHour = Math.floor(Date.now() / 1000 / 3600) * 3600;
-  const index = (currentHour - epoch) / 3600;
-
-  if (!Number.isInteger(index) || index < 0 || index >= entries.length) {
-    console.log('Published schedule does not cover the current hour. Skipping.');
-    return;
-  }
-  if (entries[index][0] !== currentHour) {
-    console.log('Schedule entry mismatch; the data file may have changed. Skipping.');
+  const arb = await req(API);
+  // Placeholder guard: when no data is up, the API returns SolNode000/Unknown/expired.
+  if (!arb || !arb.node || arb.expired || norm(arb.type) === 'unknown' || arb.node.startsWith('SolNode000')) {
+    console.log('No valid arbitration data this run.');
     return;
   }
 
-  const nodeId = entries[index][1];
-  const info = nodeInfo(nodeId, solNodes, regions);
+  const missionKey = norm(arb.type);
+  const planet = planetOf(arb.node);
 
-  const state = await readState();
-  if (!state) {
-    await writeState({ lastHour: currentHour });
-    console.log(`First run: baseline recorded for ${info.type} @ ${info.name}. No ping sent.`);
-    return;
-  }
-  if (currentHour <= state.lastHour) {
-    console.log('This hour is already processed. Nothing to do.');
+  if (seen.has(arb.id)) {
+    console.log(`Arbitration ${arb.node} already announced.`);
     return;
   }
 
-  const slug = slugFor(info.type);
-  if (TRACKED.has(slug)) {
-    const tier = TIERS[nodeId] || 'F';
-    const endUnix = currentHour + 3600;
-    const faction = factionInfo(info);
+  const missionOk = missions.size === 0 || missions.has(missionKey);
+  const planetOk = planets.size === 0 || (planet && planets.has(planet));
 
-    const fields = [
-      { name: 'Tier', value: tier, inline: true },
-      { name: 'Enemy', value: faction.name, inline: true },
-    ];
-    if (info.bonus) {
-      fields.push({ name: 'Resource bonus', value: `+${info.bonus}%`, inline: true });
-    }
-    const next = entries[index + 1];
-    if (next) {
-      const ni = nodeInfo(next[1], solNodes, regions);
-      const nt = TIERS[next[1]] || 'F';
-      fields.push({ name: 'Next up', value: `${nt} · ${ni.name} — ${ni.type}` });
-    }
-
-    const embed = {
-      title: `${MISSION_EMOJI[slug] || '🔥'} ${info.name} — ${info.type}`,
-      color: TIER_COLORS[tier],
-      description: `Ends <t:${endUnix}:t> (<t:${endUnix}:R>).`,
-      fields,
-      timestamp: new Date().toISOString(),
-      footer: {
-        text:
-          'Rotation data: browse.wf · Tier ratings: [Arbitration Tierlist](https://discord.com/channels/1100168231207059456/1112352988955160657)',
-      },
-      author: faction.icon ? { name: faction.name, icon_url: faction.icon } : undefined,
-      thumbnail: { url: BADGE_URLS[tier] },
-    };
-
-    await postEmbed(embed);
-    console.log(`Posted embed: ${info.type} @ ${info.name} (${tier} tier)`);
+  if (missionOk && planetOk) {
+    await req(WEBHOOK_URL, { method: 'POST', body: { embeds: [arbEmbed(arb)] } });
+    console.log(`Posted arbitration: ${arb.type} — ${arb.node}`);
   } else {
-    console.log(`${info.type} @ ${info.name} is not tracked. No ping.`);
+    console.log(`Skipped arbitration ${arb.type} — ${arb.node} (criteria not met).`);
   }
-
-  await writeState({ lastHour: currentHour });
 }
 
 main().catch((err) => {
