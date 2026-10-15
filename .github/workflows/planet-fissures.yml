@@ -1,0 +1,24 @@
+name: Planet fissures
+
+# Serves Discord channel: 🪐fissures-perplanet-sp
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Poll planet fissures
+        run: node planet-fissures.mjs
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          PLANET_FISSURES_CHANNEL_ID: ${{ secrets.PLANET_FISSURES_CHANNEL_ID }}
+          PLANET_FISSURES_WEBHOOK_URL: ${{ secrets.PLANET_FISSURES_WEBHOOK_URL }}
