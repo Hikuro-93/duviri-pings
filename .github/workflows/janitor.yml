@@ -19,4 +19,4 @@ jobs:
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           JANITOR_CHANNEL_IDS: ${{ secrets.JANITOR_CHANNEL_IDS }}
-          JANITOR_MAX_AGE_HOURS: '12'
+          JANITOR_MAX_AGE_HOURS: '4'
