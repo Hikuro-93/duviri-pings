@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Diagnostic: what channel are we actually looking at?
+// Diagnostic v2: dump the exact content of recent messages, escaped for hidden characters.
 const DISCORD = 'https://discord.com/api/v10';
 const BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const CHANNEL_ID = process.env.PLANET_FISSURES_CHANNEL_ID;
@@ -18,29 +18,22 @@ async function req(url, bot = true) {
 }
 
 async function main() {
-  // 1. Where does the webhook actually post?
-  const hook = await req(WEBHOOK_URL, false);
-  console.log(`Webhook "${hook.name}" posts to channel ${hook.channel_id}`);
-
-  // 2. What channel does the script search?
   const chan = await req(`${DISCORD}/channels/${CHANNEL_ID}`);
-  console.log(`CHANNEL_ID secret points to #${chan.name} (${CHANNEL_ID})`);
+  console.log(`Channel: #${chan.name} (${CHANNEL_ID})`);
 
-  if (hook.channel_id !== CHANNEL_ID) {
-    console.log('>>> MISMATCH FOUND: webhook and channel ID point at different channels!');
+  const messages = await req(`${DISCORD}/channels/${CHANNEL_ID}/messages?limit=15`);
+  console.log(`Messages found: ${messages.length}\n`);
+
+  for (const m of messages) {
+    const author = m.webhook_id ? `webhook:${m.webhook_id}` : `${m.author?.username}`;
+    console.log(`--- ${m.timestamp} | ${author} | pinned:${m.pinned}`);
+    // First 200 chars, JSON-escaped so invisible characters (variation selectors etc.) become visible
+    console.log(JSON.stringify((m.content || '').slice(0, 200)));
+    console.log(`   reactions: ${(m.reactions || []).length} | embeds: ${(m.embeds || []).length}`);
   }
 
-  // 3. What does the bot see in the last 100 messages?
-  const messages = await req(`${DISCORD}/channels/${CHANNEL_ID}/messages?limit=100`);
-  console.log(`Last 100 messages in #${chan.name}: ${messages.length} total`);
-  const boards = messages.filter((m) => (m.content || '').includes('🪙 Planet Fissure board'));
-  console.log(`Board-marker matches: ${boards.length}`);
-  for (const b of boards) {
-    const eris = (b.reactions || []).find((r) => r.emoji.name === '🦠');
-    console.log(`- ${b.id} | ${b.timestamp} | pinned:${b.pinned} | 🦠 count:${eris ? eris.count : 0} | edited:${b.edited_timestamp ? 'yes' : 'no'}`);
-  }
-  const newest = messages[0];
-  console.log(`Newest message in channel: ${newest.id} at ${newest.timestamp}`);
+  // Cross-check: what does the deployed script's marker look like, escaped?
+  const script = await (await fetch('https://raw.githubusercontent.com/Hikuro-93/duviri-pings/main/planet-fissures.mjs')).text();
+  const markerLine = script.match(/BOARD_MARKER = '([^']*)'/);
+  console.log(`\nDeployed script BOARD_MARKER escaped: ${JSON.stringify(markerLine ? markerLine[1] : 'NOT FOUND')}`);
 }
-
-main().catch((e) => { console.error(e); process.exit(1); });
