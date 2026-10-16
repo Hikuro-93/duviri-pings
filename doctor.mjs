@@ -37,3 +37,4 @@ async function main() {
   const markerLine = script.match(/BOARD_MARKER = '([^']*)'/);
   console.log(`\nDeployed script BOARD_MARKER escaped: ${JSON.stringify(markerLine ? markerLine[1] : 'NOT FOUND')}`);
 }
+main().catch((err) => { console.error(err); process.exit(1); });
