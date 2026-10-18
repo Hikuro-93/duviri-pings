@@ -79,7 +79,7 @@ async function buildContext() {
   return { planetNames, campaignAt, factionAt };
 }
 
-// ---------- assignment normalization (handles raw + normalized shapes) ----------
+// ---------- assignment parsing (verified against the live raw feed) ----------
 
 function normalizeAssignments(raw) {
   if (Array.isArray(raw)) return raw;
@@ -91,7 +91,7 @@ function normalizeAssignments(raw) {
 }
 
 function expiryOf(a) {
-  const cand = a.expiresAt ?? a.expiredAt ?? a.expiry ?? a.expires
+  const cand = a.expiration ?? a.expiresAt ?? a.expiredAt ?? a.expiry ?? a.expires
     ?? (a.settings && (a.settings.expiresAt ?? a.settings.expiredAt));
   if (typeof cand === 'number') {
     if (cand > 6e17) return (cand - 621355968000000000) / 1e4; // .NET ticks
@@ -106,10 +106,34 @@ function expiryOf(a) {
 }
 
 const idOf = (a) => a.id32 ?? a.id ?? 'unknown';
-const titleOf = (a) => a.title || (a.settings && a.settings.overrideTitle) || 'MAJOR ORDER';
 const tasksOf = (a) => a.tasks || (a.settings && a.settings.tasks) || [];
-const taskCount = (t) => Number(t.count ?? (t.counts || [])[0] ?? 0) || 0;
-const taskValues = (t) => (t.values || []).map(Number);
+
+// In the raw feed, values[i] pairs with valueTypes[i]:
+//  - valueTypes 3 marks the "primary" slot: planet index for control tasks,
+//    the target count for counter tasks (operations, kills).
+function primaryValue(t) {
+  const vals = t.values || [];
+  const types = t.valueTypes || [];
+  const i = types.indexOf(3);
+  if (i !== -1 && vals[i] !== undefined) return { value: Number(vals[i]), slot: i };
+  return { value: NaN, slot: -1 };
+}
+
+function planetsOfTask(t, ctx) {
+  const vals = (t.values || []).map(Number);
+  // Candidates: every value that is a plausible planet index.
+  const candidates = vals.filter((v) => Number.isInteger(v) && v >= 0 && v < 300 && ctx.planetNames.has(v));
+  // Prefer ones with an active campaign (MO target planets are always at war).
+  const atWar = candidates.filter((v) => ctx.campaignAt(v));
+  const pool = atWar.length > 0 ? atWar : candidates;
+  return [...new Set(pool)];
+}
+
+function countOfTask(t) {
+  const { value } = primaryValue(t);
+  // The count slot holds large numbers; planet indices live elsewhere for counter tasks.
+  return Number.isFinite(value) && value > 300 ? value : 0;
+}
 
 function pickCurrentMO(raw) {
   const now = Date.now();
@@ -120,23 +144,21 @@ function pickCurrentMO(raw) {
 
 // ---------- formatting ----------
 
-const TASK_VERB = { 3: 'Liberate', 11: 'Defend' };
-
 function describeTasks(mo, ctx) {
   const lines = [];
   for (const t of tasksOf(mo)) {
-    const vals = taskValues(t);
-    const planets = vals.map((v) => ctx.planetNames.get(v)).filter(Boolean);
+    const planets = planetsOfTask(t, ctx);
+    const count = countOfTask(t);
     const type = Number(t.type) || 0;
-    const count = taskCount(t);
     if (planets.length > 0) {
-      const camp = ctx.campaignAt(vals[0]);
-      const verb = (camp && camp.defense) ? 'Defend' : (TASK_VERB[type] || 'Liberate');
-      lines.push(`${verb} **${planets.join('**, **')}**`);
-    } else if (type === 12) {
-      lines.push(count ? `Terminate **${count.toLocaleString('en-US')}** hostiles` : 'Terminate hostiles');
-    } else {
-      lines.push(count ? `Complete **${count.toLocaleString('en-US')}** operations` : 'Objectives listed in game');
+      const camp = ctx.campaignAt(planets[0]);
+      const verb = (camp && camp.defense) ? 'Defend' : 'Liberate';
+      lines.push(`${verb} **${planets.map((p) => ctx.planetNames.get(p)).join('**, **')}**`);
+    } else if (count > 0) {
+      if (type === 3) lines.push(`Terminate **${count.toLocaleString('en-US')}** hostiles`);
+      else lines.push(`Complete **${count.toLocaleString('en-US')}** operations`);
+    } else if (type === 12 || type === 3) {
+      lines.push('Terminate hostiles');
     }
   }
   return lines;
@@ -145,17 +167,23 @@ function describeTasks(mo, ctx) {
 function progressLines(mo, ctx) {
   return tasksOf(mo).map((t, i) => {
     const p = Number((mo.progress || [])[i] ?? NaN);
-    const count = taskCount(t);
-    const vals = taskValues(t);
-    const camp = vals.length ? ctx.campaignAt(vals[0]) : null;
+    const count = countOfTask(t);
     if (count > 0) {
       const shown = Number.isFinite(p) ? Math.min(p, count) : 0;
       return `${shown.toLocaleString('en-US')}/${count.toLocaleString('en-US')}`;
     }
+    const planets = planetsOfTask(t, ctx);
+    const camp = planets.length ? ctx.campaignAt(planets[0]) : null;
     if (camp && camp.percentage != null) return `${Math.round(camp.percentage)}%`;
     if (Number.isFinite(p) && p >= 0 && p <= 100) return `${Math.round(p)}%`;
     return '—';
-  });
+  }).filter((x) => x !== '—' || true);
+}
+
+function rewardOf(mo) {
+  const r = mo.reward || (Array.isArray(mo.rewards) && mo.rewards[0]);
+  if (r && r.amount) return `${r.amount} medals`;
+  return null;
 }
 
 // ---------- channel scan ----------
@@ -182,24 +210,31 @@ async function scanChannel() {
 
 function moEmbed(mo, ctx) {
   const objectives = describeTasks(mo, ctx);
+  const rawTitle = String(mo.title || (mo.settings && mo.settings.overrideTitle) || 'MAJOR ORDER');
+  const displayTitle = /^major order$/i.test(rawTitle.trim()) ? 'MAJOR ORDER' : `MAJOR ORDER: ${rawTitle}`;
   const body = objectives.length ? objectives.join('\n')
-    : String(mo.description || mo.briefing || (mo.settings && mo.settings.overrideDescription) || '').slice(0, 300);
+    : String(mo.description || mo.briefing || '').slice(0, 300);
+
   const factions = new Set();
-  for (const t of tasksOf(mo)) for (const v of taskValues(t)) {
-    const f = ctx.factionAt(v);
+  for (const t of tasksOf(mo)) for (const p of planetsOfTask(t, ctx)) {
+    const f = ctx.factionAt(p);
     if (f) factions.add(factionFor(f).label);
   }
+  if (factions.size === 0 && /illuminate/i.test(String(mo.briefing || '') + ' ' + body)) factions.add('Illuminate');
   const emojis = [...factions].map((l) => Object.values(FACTION_DEFS).find((d) => d.label === l).emoji);
   const primary = factions.size ? factionFor([...factions][0]) : FACTION_DEFS.superearth;
+
   const exp = expiryOf(mo);
-  const prog = progressLines(mo, ctx);
+  const prog = progressLines(mo, ctx).filter((x) => x !== '—');
+  const reward = rewardOf(mo);
   return {
-    title: `${emojis.length ? emojis.join('') + ' ' : ''}MAJOR ORDER: ${titleOf(mo)}`,
+    title: `${emojis.length ? emojis.join('') + ' ' : ''}${displayTitle}`,
     description: body,
     color: primary.color,
     thumbnail: { url: primary.emblem },
     fields: [
       ...(prog.length ? [{ name: 'Progress', value: prog.join(' / '), inline: true }] : []),
+      ...(reward ? [{ name: 'Reward', value: reward, inline: true }] : []),
       ...(exp ? [{ name: 'Expires', value: `<t:${Math.floor(exp / 1000)}:R> (<t:${Math.floor(exp / 1000)}:f>)`, inline: true }] : []),
     ],
     footer: { text: `Major Order • id:${idOf(mo)}` },
@@ -230,13 +265,13 @@ async function main() {
 
   if (moMsgId && postedId === String(idOf(mo))) {
     await discordReq(`${WEBHOOK_URL}/messages/${moMsgId}`, { method: 'PATCH', body: { embeds: [moEmbed(mo, ctx)] } });
-    console.log(`Patched progress for "${titleOf(mo)}": ${progressLines(mo, ctx).join(' / ')}`);
+    console.log(`Patched progress for order ${idOf(mo)}: ${progressLines(mo, ctx).join(' / ')}`);
   } else {
     if (moMsgId) {
       await discordReq(`${DISCORD}/channels/${CHANNEL_ID}/messages/${moMsgId}`, { method: 'DELETE', bot: true }).catch(() => {});
     }
     await discordReq(WEBHOOK_URL, { method: 'POST', body: { embeds: [moEmbed(mo, ctx)] } });
-    console.log(`Posted Major Order: ${titleOf(mo)} (id ${idOf(mo)}, expires ${new Date(expiryOf(mo)).toISOString()})`);
+    console.log(`Posted Major Order id ${idOf(mo)}, expires ${new Date(expiryOf(mo)).toISOString()}`);
   }
 }
 
