@@ -4,7 +4,7 @@
 // notifications), existing ones are live-patched with progress every run.
 
 const DISCORD = 'https://discord.com/api/v10';
-const API = 'https://api.helldivers2.dev/api/v1';
+const HD2_API = 'https://api.helldivers2.dev/api/v1';
 const TM = 'https://helldiverstrainingmanual.com/api/v1';
 const HD2_HEADERS = {
   'X-Super-Client': 'github.com/Hikuro-93/duviri-pings',
@@ -37,8 +37,6 @@ function factionFor(name) {
   return FACTION_DEFS.superearth;
 }
 
-const OWNER_FACTION = { 1: 'Terminids', 2: 'Automatons', 3: 'Illuminate' };
-
 async function getJSON(url, headers) {
   try {
     const res = await fetch(url, { headers: headers || {} });
@@ -65,7 +63,7 @@ async function discordReq(url, { method = 'GET', body, bot = false } = {}) {
   return t ? JSON.parse(t) : null;
 }
 
-// ---------- war context ----------
+// ---------- war context (training manual API, verified live) ----------
 
 async function buildContext() {
   const planetsRaw = await getJSON(`${TM}/planets`);
@@ -76,51 +74,74 @@ async function buildContext() {
     }
   }
 
-  const ws = await getJSON(`${API}/warstatus`, HD2_HEADERS);
-  const campaigns = (ws && ws.campaigns) || [];
-  const ownerByIndex = new Map();
-  for (const p of (ws && ws.planetStatus) || []) ownerByIndex.set(Number(p.index), Number(p.owner));
+  // [{ planetIndex, name, faction, defense, percentage, ... }]
+  const campaigns = (await getJSON(`${TM}/war/campaign`)) || [];
+  const byIndex = new Map(campaigns.map((c) => [Number(c.planetIndex), c]));
 
+  const campaignAt = (planetIndex) => byIndex.get(Number(planetIndex)) || null;
   const factionAt = (planetIndex) => {
-    for (const c of campaigns) {
-      if (Number(c.planetIndex) === Number(planetIndex)) return String(c.faction || '');
-    }
-    return OWNER_FACTION[ownerByIndex.get(Number(planetIndex))] || '';
+    const c = campaignAt(planetIndex);
+    return c ? String(c.faction || '') : '';
   };
 
-  return { planetNames, factionAt };
+  return { planetNames, campaignAt, factionAt };
 }
+
+// ---------- assignments (helldivers2.dev, header-gated) ----------
+
+function normalizeAssignments(raw) {
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === 'object') {
+    if (Array.isArray(raw.assignments)) return raw.assignments;
+    return Object.values(raw); // keyed by index, e.g. { "0": {...}, "8": {...} }
+  }
+  return [];
+}
+
+function expiryOf(a) {
+  for (const k of ['expiresAt', 'expiredAt', 'expiry', 'expires']) {
+    if (a && a[k] && Date.parse(a[k]) > 0) return Date.parse(a[k]);
+  }
+  return 0;
+}
+
+function pickCurrentMO(raw) {
+  const now = Date.now();
+  return normalizeAssignments(raw)
+    .filter((a) => a && a.title && expiryOf(a) > now)
+    .sort((a, b) => expiryOf(b) - expiryOf(a))[0] || null;
+}
+
+// ---------- formatting ----------
 
 function describeTasks(mo, ctx) {
   const lines = [];
   for (const t of mo.tasks || []) {
-    const names = (t.values || []).map((v) => ctx.planetNames.get(Number(v)) || `Sector #${v}`);
-    const verb = Number(t.type) === 11 ? 'Defend' : 'Liberate';
-    if (names.length > 0) lines.push(`${verb} **${names.join('**, **')}**`);
-    else if (t.count) lines.push(`Complete **${t.count}** operations`);
+    const planets = (t.values || []).map((v) => ctx.planetNames.get(Number(v)) || `Sector #${v}`);
+    if (planets.length > 0) {
+      const verb = (ctx.campaignAt(t.values[0]) || {}).defense ? 'Defend' : 'Liberate';
+      lines.push(`${verb} **${planets.join('**, **')}**`);
+    } else if (t.count) {
+      lines.push(`Complete **${t.count}** operations`);
+    }
   }
   return lines;
 }
 
-function progressLines(mo) {
+function progressLines(mo, ctx) {
   return (mo.tasks || []).map((t, i) => {
-    const p = Number((mo.progress || [])[i] ?? 0);
-    if (Number(t.type) === 3) return `${p}%`;
-    if (t.count) return `${Math.min(p, t.count)}/${t.count}`;
-    return String(p);
+    const p = Number((mo.progress || [])[i] ?? NaN);
+    if (Number.isFinite(p) && p > 0) {
+      return p <= 100 ? `${Math.round(p)}%` : String(p);
+    }
+    // Fallback: live campaign percentage for the task's first planet.
+    const c = t.values && t.values[0] !== undefined ? ctx.campaignAt(t.values[0]) : null;
+    return c && c.percentage != null ? `${Math.round(c.percentage)}%` : '—';
   });
 }
 
-function toUnix(iso) {
-  const t = Date.parse(iso);
-  return Number.isFinite(t) ? Math.floor(t / 1000) : null;
-}
-
-function pickCurrentMO(assignments) {
-  const list = Array.isArray(assignments) ? assignments : (assignments && assignments.assignments) || [];
-  return list
-    .filter((a) => a && a.title && a.expiresAt && Date.parse(a.expiresAt) > Date.now())
-    .sort((a, b) => Date.parse(b.expiresAt) - Date.parse(a.expiresAt))[0] || null;
+function toUnix(ms) {
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
 }
 
 // ---------- channel scan ----------
@@ -136,9 +157,9 @@ async function scanChannel() {
       const mo = f.match(/Major Order • id:(\d+)/);
       if (mo) {
         if (moMsgId === null) { moMsgId = m.id; postedId = mo[1]; }
-        else stale.add(m.id); // duplicate MO messages
+        else stale.add(m.id);
       } else if (/HD2 daily orders • date:/.test(f)) {
-        stale.add(m.id); // obsolete briefing cleanup from the old design
+        stale.add(m.id); // cleanup from the old briefing design
       }
     }
   }
@@ -157,8 +178,8 @@ function moEmbed(mo, ctx) {
   }
   const emojis = [...factions].map((l) => Object.values(FACTION_DEFS).find((d) => d.label === l).emoji);
   const primary = factions.size ? factionFor([...factions][0]) : FACTION_DEFS.superearth;
-  const exp = toUnix(mo.expiresAt);
-  const prog = progressLines(mo);
+  const exp = toUnix(expiryOf(mo));
+  const prog = progressLines(mo, ctx);
   return {
     title: `${emojis.length ? emojis.join('') + ' ' : ''}MAJOR ORDER: ${mo.title}`,
     description: body,
@@ -176,30 +197,33 @@ function moEmbed(mo, ctx) {
 // ---------- main ----------
 
 async function main() {
-  const assignments = await getJSON(`${API}/assignments`, HD2_HEADERS);
-  if (!assignments) throw new Error('Assignments feed unavailable.');
-  const mo = pickCurrentMO(assignments);
+  const raw = await getJSON(`${HD2_API}/assignments`, HD2_HEADERS);
+  if (!raw) throw new Error('Assignments feed unavailable.');
+  const mo = pickCurrentMO(raw);
+
+  if (!mo) {
+    const all = normalizeAssignments(raw);
+    console.log(`No active Major Order found (${all.length} assignment(s) in feed).`);
+    if (all.length > 0) console.log(`First entry for diagnosis: ${JSON.stringify(all[0]).slice(0, 300)}`);
+    return;
+  }
+
   const ctx = await buildContext();
   const { moMsgId, postedId, stale } = await scanChannel();
 
-  // Clean up duplicates and any leftovers from the old briefing design.
   for (const id of stale) {
     await discordReq(`${DISCORD}/channels/${CHANNEL_ID}/messages/${id}`, { method: 'DELETE', bot: true }).catch(() => {});
   }
 
-  if (mo && moMsgId && postedId === String(mo.id32)) {
-    // Same order: live-patch progress and expiry. Edits don't trigger notifications.
+  if (moMsgId && postedId === String(mo.id32)) {
     await discordReq(`${WEBHOOK_URL}/messages/${moMsgId}`, { method: 'PATCH', body: { embeds: [moEmbed(mo, ctx)] } });
-    console.log(`Patched progress for "${mo.title}": ${progressLines(mo).join(' / ')}`);
-  } else if (mo) {
-    // New order: replace the old message with a fresh post (this is the ping).
+    console.log(`Patched progress for "${mo.title}": ${progressLines(mo, ctx).join(' / ')}`);
+  } else {
     if (moMsgId) {
       await discordReq(`${DISCORD}/channels/${CHANNEL_ID}/messages/${moMsgId}`, { method: 'DELETE', bot: true }).catch(() => {});
     }
     await discordReq(WEBHOOK_URL, { method: 'POST', body: { embeds: [moEmbed(mo, ctx)] } });
     console.log(`Posted Major Order: ${mo.title}`);
-  } else {
-    console.log('No active Major Order; leaving previous message in place until the next one drops.');
   }
 }
 
