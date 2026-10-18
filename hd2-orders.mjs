@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// Helldivers 2 orders: ping new Major Orders + daily 9AM Azores digest.
-// Stateless: seen MO IDs and today's digest are recovered from past embed footers.
+// Helldivers 2 Major Order tracker.
+// One message per MO: new orders post fresh (ping via channel "All messages"
+// notifications), existing ones are live-patched with progress every run.
 
 const DISCORD = 'https://discord.com/api/v10';
 const API = 'https://api.helldivers2.dev/api/v1';
@@ -93,14 +94,10 @@ async function buildContext() {
 function describeTasks(mo, ctx) {
   const lines = [];
   for (const t of mo.tasks || []) {
-    const names = (t.values || [])
-      .map((v) => ctx.planetNames.get(Number(v)) || `Sector #${v}`);
+    const names = (t.values || []).map((v) => ctx.planetNames.get(Number(v)) || `Sector #${v}`);
     const verb = Number(t.type) === 11 ? 'Defend' : 'Liberate';
-    if (names.length > 0) {
-      lines.push(`${verb} **${names.join('**, **')}**`);
-    } else if (t.count) {
-      lines.push(`Complete **${t.count}** operations`);
-    }
+    if (names.length > 0) lines.push(`${verb} **${names.join('**, **')}**`);
+    else if (t.count) lines.push(`Complete **${t.count}** operations`);
   }
   return lines;
 }
@@ -126,31 +123,33 @@ function pickCurrentMO(assignments) {
     .sort((a, b) => Date.parse(b.expiresAt) - Date.parse(a.expiresAt))[0] || null;
 }
 
-// ---------- channel history ----------
+// ---------- channel scan ----------
 
-async function seenFooters() {
+async function scanChannel() {
   const messages = await discordReq(`${DISCORD}/channels/${CHANNEL_ID}/messages?limit=50`, { bot: true });
-  const moIds = new Set();
-  let digestDate = null;
+  let moMsgId = null;
+  let postedId = null;
+  const stale = new Set();
   for (const m of messages || []) {
     for (const e of m.embeds || []) {
       const f = ((e.footer && e.footer.text) || '');
       const mo = f.match(/Major Order • id:(\d+)/);
-      if (mo) moIds.add(mo[1]);
-      const dg = f.match(/HD2 daily orders • date:(\d{4}-\d{2}-\d{2})/);
-      if (dg) digestDate = dg[1];
+      if (mo) {
+        if (moMsgId === null) { moMsgId = m.id; postedId = mo[1]; }
+        else stale.add(m.id); // duplicate MO messages
+      } else if (/HD2 daily orders • date:/.test(f)) {
+        stale.add(m.id); // obsolete briefing cleanup from the old design
+      }
     }
   }
-  return { moIds, digestDate };
+  return { moMsgId, postedId, stale };
 }
 
-// ---------- embeds ----------
+// ---------- embed ----------
 
 function moEmbed(mo, ctx) {
   const objectives = describeTasks(mo, ctx);
-  const body = objectives.length
-    ? objectives.join('\n')
-    : String(mo.description || mo.briefing || '').slice(0, 300);
+  const body = objectives.length ? objectives.join('\n') : String(mo.description || mo.briefing || '').slice(0, 300);
   const factions = new Set();
   for (const t of mo.tasks || []) for (const v of t.values || []) {
     const f = ctx.factionAt(v);
@@ -174,56 +173,34 @@ function moEmbed(mo, ctx) {
   };
 }
 
-function digestEmbed(mo, ctx, dateStr) {
-  const fields = [];
-  if (mo) {
-    const exp = toUnix(mo.expiresAt);
-    const prog = progressLines(mo);
-    if (prog.length) fields.push({ name: 'Progress', value: prog.join(' / '), inline: true });
-    if (exp) fields.push({ name: 'Expires', value: `<t:${exp}:R> (<t:${exp}:f>)`, inline: true });
-  }
-  return {
-    title: '📋 Daily Orders Briefing',
-    description: mo
-      ? `Active Major Order: **${mo.title}**\n${describeTasks(mo, ctx).join('\n')}`
-      : 'No active Major Order at this time.',
-    color: FACTION_DEFS.superearth.color,
-    thumbnail: { url: FACTION_DEFS.superearth.emblem },
-    fields,
-    footer: { text: `HD2 daily orders • date:${dateStr}` },
-    timestamp: new Date().toISOString(),
-  };
-}
-
 // ---------- main ----------
 
 async function main() {
-  const now = new Date();
-  const azores = (fmt, opts) => new Intl.DateTimeFormat(fmt, { timeZone: 'Atlantic/Azores', ...opts }).format(now);
-  const dateStr = azores('en-CA'); // YYYY-MM-DD
-  const azoresHour = Number(azores('en-GB', { hour: 'numeric', hour12: false }));
-
   const assignments = await getJSON(`${API}/assignments`, HD2_HEADERS);
   if (!assignments) throw new Error('Assignments feed unavailable.');
   const mo = pickCurrentMO(assignments);
-
   const ctx = await buildContext();
-  const { moIds, digestDate } = await seenFooters();
-  let posted = 0;
+  const { moMsgId, postedId, stale } = await scanChannel();
 
-  if (mo && !moIds.has(String(mo.id32))) {
+  // Clean up duplicates and any leftovers from the old briefing design.
+  for (const id of stale) {
+    await discordReq(`${DISCORD}/channels/${CHANNEL_ID}/messages/${id}`, { method: 'DELETE', bot: true }).catch(() => {});
+  }
+
+  if (mo && moMsgId && postedId === String(mo.id32)) {
+    // Same order: live-patch progress and expiry. Edits don't trigger notifications.
+    await discordReq(`${WEBHOOK_URL}/messages/${moMsgId}`, { method: 'PATCH', body: { embeds: [moEmbed(mo, ctx)] } });
+    console.log(`Patched progress for "${mo.title}": ${progressLines(mo).join(' / ')}`);
+  } else if (mo) {
+    // New order: replace the old message with a fresh post (this is the ping).
+    if (moMsgId) {
+      await discordReq(`${DISCORD}/channels/${CHANNEL_ID}/messages/${moMsgId}`, { method: 'DELETE', bot: true }).catch(() => {});
+    }
     await discordReq(WEBHOOK_URL, { method: 'POST', body: { embeds: [moEmbed(mo, ctx)] } });
     console.log(`Posted Major Order: ${mo.title}`);
-    posted++;
+  } else {
+    console.log('No active Major Order; leaving previous message in place until the next one drops.');
   }
-
-  if (azoresHour >= 9 && digestDate !== dateStr) {
-    await discordReq(WEBHOOK_URL, { method: 'POST', body: { embeds: [digestEmbed(mo, ctx, dateStr)] } });
-    console.log(`Posted daily digest for ${dateStr}.`);
-    posted++;
-  }
-
-  console.log(`HD2 orders done: ${mo ? `MO "${mo.title}" active` : 'no active MO'}, digest ${digestDate === dateStr ? 'already sent' : 'pending'}, ${posted} message(s) posted.`);
 }
 
 main().catch((err) => { console.error(err); process.exit(1); });
